@@ -1,6 +1,6 @@
 [package]
 name = "vylo-app"
-version = "1.0.0"
+version = "1.0.1"
 description = "Vylo Mouse Share desktop app"
 edition = "2021"
 license = "GPL-3.0-or-later"
