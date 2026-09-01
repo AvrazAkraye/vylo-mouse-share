@@ -5817,6 +5817,8 @@ dependencies = [
  "arboard",
  "bincode",
  "clap",
+ "core-foundation",
+ "core-foundation-sys",
  "dirs 6.0.0",
  "env_logger",
  "futures",
@@ -5851,6 +5853,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "webrtc-dtls",
  "webrtc-util",
+ "windows",
 ]
 
 [[package]]

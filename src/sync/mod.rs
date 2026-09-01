@@ -10,6 +10,7 @@
 mod clipboard;
 mod discovery;
 mod files;
+mod keyboard;
 mod pairing;
 mod proto;
 mod tls;
@@ -65,6 +66,7 @@ pub(crate) enum SyncRequest {
     CancelPairing,
     SendFiles(Vec<PathBuf>),
     SetClipboardSync(bool),
+    SetKeyboardLayoutSync(bool),
     SetFileDir(PathBuf),
     SetDeviceName(String),
     /// an address the peer was seen at (from the input channel);
@@ -110,6 +112,7 @@ impl EventSender {
 pub(crate) struct SyncOptions {
     pub(crate) sync_port: u16,
     pub(crate) clipboard_sync: bool,
+    pub(crate) keyboard_layout_sync: bool,
     pub(crate) file_dir: PathBuf,
     pub(crate) device_name: String,
 }
@@ -210,6 +213,8 @@ struct Actor {
     file_dir: Rc<RefCell<PathBuf>>,
     clipboard_enabled: Arc<AtomicBool>,
     clipboard: Rc<clipboard::ClipboardMonitor>,
+    keyboard_enabled: Arc<AtomicBool>,
+    keyboard: Rc<keyboard::KeyboardMonitor>,
     pairing_open: Arc<AtomicBool>,
     /// pin of the open pairing window, if any
     pairing: Option<(String, Instant)>,
@@ -222,6 +227,8 @@ struct Actor {
     /// busy, e.g. during a file transfer); retried on the next tick so
     /// copies made mid-transfer aren't silently dropped
     pending_clip: Option<(SyncMessage, ClipboardKind)>,
+    /// a local keyboard-language change awaiting a free queue slot
+    pending_layout: Option<String>,
     conn_seq: u64,
     candidates: HashSet<IpAddr>,
     dialing: bool,
@@ -255,6 +262,13 @@ async fn run_actor(
         clipboard_enabled.clone(),
     ));
 
+    let keyboard_enabled = Arc::new(AtomicBool::new(opts.keyboard_layout_sync));
+    let (layout_tx, mut layout_rx) = mpsc::unbounded_channel();
+    let keyboard = Rc::new(keyboard::KeyboardMonitor::new(
+        layout_tx,
+        keyboard_enabled.clone(),
+    ));
+
     let (peers_tx, mut peers_rx) = mpsc::unbounded_channel();
     let (internal_tx, mut internal_rx) = local_channel::mpsc::channel();
 
@@ -267,6 +281,8 @@ async fn run_actor(
         file_dir: Rc::new(RefCell::new(opts.file_dir)),
         clipboard_enabled,
         clipboard,
+        keyboard_enabled,
+        keyboard,
         pairing_open,
         pairing: None,
         pairing_dial: false,
@@ -274,6 +290,7 @@ async fn run_actor(
         internal_tx,
         active: None,
         pending_clip: None,
+        pending_layout: None,
         conn_seq: 0,
         candidates: HashSet::new(),
         dialing: false,
@@ -315,6 +332,7 @@ async fn run_actor(
                 }
             }
             Some(change) = change_rx.recv() => actor.handle_clip_change(change),
+            Some(lang) = layout_rx.recv() => actor.handle_layout_change(lang),
             Some(peers) = peers_rx.recv() => actor.events.send(SyncEvent::PeersDiscovered(peers)),
             Some(internal) = internal_rx.recv() => actor.handle_internal(internal),
             _ = tick.tick() => {
@@ -392,6 +410,9 @@ impl Actor {
             SyncRequest::SetClipboardSync(enabled) => {
                 self.clipboard_enabled.store(enabled, Ordering::SeqCst);
             }
+            SyncRequest::SetKeyboardLayoutSync(enabled) => {
+                self.keyboard_enabled.store(enabled, Ordering::SeqCst);
+            }
             SyncRequest::SetFileDir(dir) => *self.file_dir.borrow_mut() = dir,
             SyncRequest::SetDeviceName(name) => {
                 if name != self.device_name {
@@ -425,6 +446,7 @@ impl Actor {
             }
         }
         self.flush_pending_clip();
+        self.flush_pending_layout();
         self.maybe_dial();
     }
 
@@ -472,6 +494,8 @@ impl Actor {
             file_dir: self.file_dir.clone(),
             clipboard: self.clipboard.clone(),
             clipboard_enabled: self.clipboard_enabled.clone(),
+            keyboard: self.keyboard.clone(),
+            keyboard_enabled: self.keyboard_enabled.clone(),
             events: self.events.clone(),
             internal: self.internal_tx.clone(),
         }
@@ -604,6 +628,36 @@ impl Actor {
         }
     }
 
+    fn handle_layout_change(&mut self, lang: String) {
+        self.send_layout(lang);
+    }
+
+    fn send_layout(&mut self, lang: String) {
+        let Some(active) = &self.active else {
+            self.pending_layout = Some(lang);
+            return;
+        };
+        match active.out_tx.try_send(SyncMessage::KeyboardLayout { lang }) {
+            Ok(()) => self.pending_layout = None,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                if let SyncMessage::KeyboardLayout { lang } = msg {
+                    self.pending_layout = Some(lang);
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.pending_layout = None;
+            }
+        }
+    }
+
+    fn flush_pending_layout(&mut self) {
+        if self.active.is_some() {
+            if let Some(lang) = self.pending_layout.take() {
+                self.send_layout(lang);
+            }
+        }
+    }
+
     fn handle_internal(&mut self, internal: Internal) {
         match internal {
             Internal::Established {
@@ -650,6 +704,7 @@ impl Actor {
                     });
                     self.active = Some(new);
                     self.flush_pending_clip();
+                    self.flush_pending_layout();
                 } else {
                     new.cancel.cancel();
                 }
@@ -709,6 +764,8 @@ struct ConnCtx {
     file_dir: Rc<RefCell<PathBuf>>,
     clipboard: Rc<clipboard::ClipboardMonitor>,
     clipboard_enabled: Arc<AtomicBool>,
+    keyboard: Rc<keyboard::KeyboardMonitor>,
+    keyboard_enabled: Arc<AtomicBool>,
     events: EventSender,
     internal: local_channel::mpsc::Sender<Internal>,
 }
@@ -895,6 +952,11 @@ async fn reader_loop(
             }
             SyncMessage::Pong | SyncMessage::Hello { .. } => (),
 
+            SyncMessage::KeyboardLayout { lang } => {
+                if ctx.keyboard_enabled.load(Ordering::SeqCst) {
+                    ctx.keyboard.apply(lang);
+                }
+            }
             SyncMessage::ClipText { text } => {
                 if ctx.clipboard_enabled.load(Ordering::SeqCst) {
                     ctx.clipboard.apply(clipboard::Apply::Text(text));
@@ -1300,6 +1362,18 @@ mod tests {
                 assert_eq!(offset, 1234);
                 assert_eq!(data, vec![42u8; 4096]);
             }
+            other => panic!("wrong message: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keyboard_layout_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        write_msg(&mut a, &SyncMessage::KeyboardLayout { lang: "ar".into() })
+            .await
+            .expect("write");
+        match read_msg(&mut b).await.expect("read") {
+            SyncMessage::KeyboardLayout { lang } => assert_eq!(lang, "ar"),
             other => panic!("wrong message: {other:?}"),
         }
     }

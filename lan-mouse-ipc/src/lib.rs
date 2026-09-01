@@ -241,6 +241,7 @@ pub enum FrontendEvent {
     /// vylo settings state (part of initial sync)
     VyloState {
         clipboard_sync: bool,
+        keyboard_layout_sync: bool,
         file_dir: String,
         device_name: String,
         sync_port: u16,
@@ -342,6 +343,8 @@ pub enum FrontendRequest {
     SendFiles(Vec<String>),
     /// enable / disable clipboard sync
     SetClipboardSync(bool),
+    /// enable / disable keyboard input-language sync
+    SetKeyboardLayoutSync(bool),
     /// set the directory incoming files are written to
     SetFileDir(String),
     /// set this device's name

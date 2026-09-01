@@ -146,6 +146,16 @@ export function SettingsScreen() {
               {s.vylo?.sync_port ?? 4243}
             </Badge>
           </Row>
+          <Row
+            label="Sync keyboard language"
+            hint="Switch the paired device's input language when you switch yours"
+          >
+            <Switch
+              checked={s.vylo?.keyboard_layout_sync ?? true}
+              aria-label="Sync keyboard language"
+              onCheckedChange={(v) => requests.setKeyboardLayoutSync(v)}
+            />
+          </Row>
           <Row label="Start on login" hint="Launch Vylo when you sign in">
             <Switch
               checked={autostart ?? false}

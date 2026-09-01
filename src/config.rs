@@ -70,6 +70,7 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     clipboard_sync: Option<bool>,
+    keyboard_layout_sync: Option<bool>,
     file_dir: Option<PathBuf>,
     sync_port: Option<u16>,
     device_name: Option<String>,
@@ -512,6 +513,21 @@ impl Config {
             .as_ref()
             .and_then(|c| c.clipboard_sync)
             .unwrap_or(true)
+    }
+
+    /// whether a keyboard input-language change on one machine is
+    /// mirrored to the peer (so scancode-forwarded typing matches)
+    pub fn keyboard_layout_sync(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.keyboard_layout_sync)
+            .unwrap_or(true)
+    }
+
+    pub fn set_keyboard_layout_sync(&mut self, enabled: bool) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .keyboard_layout_sync = Some(enabled);
     }
 
     pub fn set_clipboard_sync(&mut self, enabled: bool) {

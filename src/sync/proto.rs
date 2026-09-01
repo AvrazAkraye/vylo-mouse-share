@@ -31,6 +31,14 @@ pub(crate) enum SyncMessage {
         name: String,
     },
 
+    /* keyboard layout / input language sync: the sender switched its
+     * keyboard input language; the receiver activates the matching one
+     * so scancode-forwarded typing produces the same characters. `lang`
+     * is a primary language code (ISO 639-1, e.g. "en", "ar", "fr"). */
+    KeyboardLayout {
+        lang: String,
+    },
+
     /* clipboard */
     ClipText {
         text: String,

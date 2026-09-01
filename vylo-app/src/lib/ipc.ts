@@ -54,6 +54,7 @@ export interface SyncStatus {
 
 export interface VyloState {
   clipboard_sync: boolean;
+  keyboard_layout_sync: boolean;
   file_dir: string;
   device_name: string;
   sync_port: number;
@@ -224,6 +225,7 @@ export const requests = {
   pairWithPeer: (addr: string, pin: string) => send({ PairWithPeer: { addr, pin } }),
   sendFiles: (paths: string[]) => send({ SendFiles: paths }),
   setClipboardSync: (enabled: boolean) => send({ SetClipboardSync: enabled }),
+  setKeyboardLayoutSync: (enabled: boolean) => send({ SetKeyboardLayoutSync: enabled }),
   setFileDir: (dir: string) => send({ SetFileDir: dir }),
   setDeviceName: (name: string) => send({ SetDeviceName: name }),
 };

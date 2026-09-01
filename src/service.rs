@@ -114,6 +114,7 @@ impl Service {
             SyncOptions {
                 sync_port: config.sync_port(),
                 clipboard_sync: config.clipboard_sync(),
+                keyboard_layout_sync: config.keyboard_layout_sync(),
                 file_dir: config.file_dir(),
                 device_name: config.device_name(),
             },
@@ -267,6 +268,13 @@ impl Service {
                 self.save_config();
                 self.broadcast_vylo_state();
             }
+            FrontendRequest::SetKeyboardLayoutSync(enabled) => {
+                self.config.set_keyboard_layout_sync(enabled);
+                self.sync
+                    .request(SyncRequest::SetKeyboardLayoutSync(enabled));
+                self.save_config();
+                self.broadcast_vylo_state();
+            }
             FrontendRequest::SetFileDir(dir) => {
                 let dir = PathBuf::from(dir);
                 self.config.set_file_dir(dir.clone());
@@ -371,6 +379,7 @@ impl Service {
     fn broadcast_vylo_state(&mut self) {
         self.notify_frontend(FrontendEvent::VyloState {
             clipboard_sync: self.config.clipboard_sync(),
+            keyboard_layout_sync: self.config.keyboard_layout_sync(),
             file_dir: self.config.file_dir().display().to_string(),
             device_name: self.config.device_name(),
             sync_port: self.config.sync_port(),
@@ -421,6 +430,9 @@ impl Service {
             .clone_from(&authorized_keys);
         self.sync
             .request(SyncRequest::SetClipboardSync(self.config.clipboard_sync()));
+        self.sync.request(SyncRequest::SetKeyboardLayoutSync(
+            self.config.keyboard_layout_sync(),
+        ));
         self.sync
             .request(SyncRequest::SetFileDir(self.config.file_dir()));
         self.sync
