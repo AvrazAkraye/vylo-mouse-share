@@ -331,6 +331,15 @@ impl Service {
         for handle in self.client_manager.registered_clients() {
             if let Some((c, _)) = self.client_manager.get_state(handle) {
                 if c.fix_ips.contains(&addr) || c.hostname.as_deref() == Some(name) {
+                    // Re-pairing an existing peer: merge the freshly
+                    // learned address into its fixed IPs so the input
+                    // channel dials the current address (e.g. after a
+                    // DHCP lease change) rather than a stale one.
+                    if !c.fix_ips.contains(&addr) {
+                        let mut ips = c.fix_ips.clone();
+                        ips.push(addr);
+                        self.client_manager.set_fix_ips(handle, ips);
+                    }
                     self.activate_client(handle);
                     self.broadcast_client(handle);
                     return;

@@ -59,7 +59,22 @@ pub(crate) fn sanitize_name(offered: &str) -> Option<String> {
         })
         .collect();
     let name = name.trim_matches([' ', '.']).to_string();
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        return None;
+    }
+    // avoid Windows reserved device names (CON, NUL, COM1..9, LPT1..9);
+    // the rule ignores the extension, so "NUL.txt" is reserved too
+    let stem = name.split('.').next().unwrap_or(&name).to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0');
+    if reserved {
+        Some(format!("_{name}"))
+    } else {
+        Some(name)
+    }
 }
 
 /// `name.ext` -> `name (1).ext`, `name (2).ext`, ... until unused

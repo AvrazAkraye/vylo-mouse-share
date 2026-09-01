@@ -36,11 +36,20 @@ pub(crate) enum TlsSetupError {
 }
 
 /// Accepts a peer certificate iff its sha256 fingerprint is in the
-/// allowlist, or a pairing window is currently open.
+/// allowlist — or, when `allow_pairing` is set, while a pairing window
+/// is open. Only the *acceptor* and the dedicated pairing *dialer* set
+/// `allow_pairing`: an unauthorized inbound peer during a pairing
+/// window still has to complete the PIN exchange (see
+/// [`super::pairing`]) before its fingerprint is trusted, and the
+/// pairing dialer likewise proves the PIN before treating the peer as
+/// paired. Ordinary outbound sync dials use a policy with
+/// `allow_pairing = false`, so they can never be redirected to an
+/// unpinned attacker while a window happens to be open.
 #[derive(Debug)]
 struct FingerprintPolicy {
     authorized: Arc<RwLock<HashMap<String, String>>>,
     pairing_open: Arc<AtomicBool>,
+    allow_pairing: bool,
     provider: Arc<CryptoProvider>,
 }
 
@@ -52,7 +61,7 @@ impl FingerprintPolicy {
             .read()
             .expect("lock")
             .contains_key(&fingerprint)
-            || self.pairing_open.load(Ordering::SeqCst)
+            || (self.allow_pairing && self.pairing_open.load(Ordering::SeqCst))
         {
             Ok(())
         } else {
@@ -181,46 +190,71 @@ impl ClientCertVerifier for PinnedClientVerifier {
     }
 }
 
-pub(crate) struct TlsPair {
+pub(crate) struct TlsConfigs {
+    /// accepts inbound connections; admits unauthorized peers only
+    /// while a pairing window is open (they still must pass the PIN)
     pub(crate) acceptor: TlsAcceptor,
+    /// dials known, already-authorized peers; NEVER admits an unpinned
+    /// server certificate, regardless of pairing state
     pub(crate) connector: TlsConnector,
+    /// dials a specific peer for pairing; admits its (as yet unpinned)
+    /// certificate so the PIN exchange can run over the session
+    pub(crate) pairing_connector: TlsConnector,
+}
+
+fn build_connector(
+    provider: &Arc<CryptoProvider>,
+    certs: &[CertificateDer<'static>],
+    key: &PrivateKeyDer<'static>,
+    policy: FingerprintPolicy,
+) -> Result<TlsConnector, TlsSetupError> {
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServerVerifier(policy)))
+        .with_client_auth_cert(certs.to_vec(), key.clone_key())
+        .map_err(|_| TlsSetupError::MissingKey)?;
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 pub(crate) fn build_tls(
     cert: &Certificate,
     authorized: Arc<RwLock<HashMap<String, String>>>,
     pairing_open: Arc<AtomicBool>,
-) -> Result<TlsPair, TlsSetupError> {
+) -> Result<TlsConfigs, TlsSetupError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     let certs: Vec<CertificateDer<'static>> = cert.certificate.clone();
     let key = PrivateKeyDer::Pkcs8(cert.private_key.serialized_der.clone().into());
 
-    let policy = || FingerprintPolicy {
+    let policy = |allow_pairing: bool| FingerprintPolicy {
         authorized: authorized.clone(),
         pairing_open: pairing_open.clone(),
+        allow_pairing,
         provider: provider.clone(),
     };
 
-    let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedServerVerifier(policy())))
-        .with_client_auth_cert(certs.clone(), key.clone_key())
-        .map_err(|_| TlsSetupError::MissingKey)?;
+    // strict outbound: allowlist only, pairing window is irrelevant
+    let connector = build_connector(&provider, &certs, &key, policy(false))?;
+    // pairing outbound: admit the unpinned peer, PIN proof follows
+    let pairing_connector = build_connector(&provider, &certs, &key, policy(true))?;
 
+    // acceptor honors the pairing window (inbound pairing is legit);
+    // an admitted unauthorized peer is still routed through the PIN
+    // exchange before it is trusted
     let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()?
         .with_client_cert_verifier(Arc::new(PinnedClientVerifier {
-            policy: policy(),
+            policy: policy(true),
             root_hints: Vec::new(),
         }))
         .with_single_cert(certs, key)
         .map_err(|_| TlsSetupError::MissingKey)?;
 
-    Ok(TlsPair {
+    Ok(TlsConfigs {
         acceptor: TlsAcceptor::from(Arc::new(server_config)),
-        connector: TlsConnector::from(Arc::new(client_config)),
+        connector,
+        pairing_connector,
     })
 }
 

@@ -30,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::ReadHalf,
+    io::{ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
     task::{JoinHandle, spawn_local},
@@ -43,6 +43,11 @@ const PAIRING_WINDOW: Duration = Duration::from_secs(120);
 const DIAL_INTERVAL: Duration = Duration::from_secs(3);
 const READ_TIMEOUT: Duration = Duration::from_secs(45);
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// a single frame write must complete within this bound, else the peer
+/// is treated as dead (prevents a non-reading peer wedging the writer)
+const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+/// a full PIN pairing exchange must complete within this bound
+const PAIRING_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const OUT_QUEUE: usize = 32;
 
 static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
@@ -198,7 +203,7 @@ struct ActiveConn {
 
 struct Actor {
     authorized: Arc<RwLock<HashMap<String, String>>>,
-    tls: tls::TlsPair,
+    tls: tls::TlsConfigs,
     local_fp: String,
     sync_port: u16,
     device_name: String,
@@ -213,6 +218,10 @@ struct Actor {
     events: EventSender,
     internal_tx: local_channel::mpsc::Sender<Internal>,
     active: Option<ActiveConn>,
+    /// a local clipboard change that couldn't be enqueued yet (queue
+    /// busy, e.g. during a file transfer); retried on the next tick so
+    /// copies made mid-transfer aren't silently dropped
+    pending_clip: Option<(SyncMessage, ClipboardKind)>,
     conn_seq: u64,
     candidates: HashSet<IpAddr>,
     dialing: bool,
@@ -264,6 +273,7 @@ async fn run_actor(
         events,
         internal_tx,
         active: None,
+        pending_clip: None,
         conn_seq: 0,
         candidates: HashSet::new(),
         dialing: false,
@@ -272,25 +282,24 @@ async fn run_actor(
     };
     actor.start_discovery();
 
-    let listener = {
-        let mut attempt = 0u32;
-        loop {
-            match TcpListener::bind(("0.0.0.0", actor.sync_port)).await {
-                Ok(l) => break l,
-                Err(e) => {
-                    attempt += 1;
-                    if attempt == 1 {
-                        log::error!(
-                            "cannot listen on sync port {}: {e} — retrying",
-                            actor.sync_port
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
+    // Bind the listener without blocking the actor: if the port is
+    // taken we still process requests (pairing as the dialing side,
+    // config changes) and keep retrying the bind on each tick, rather
+    // than hanging silently until the port frees up.
+    let mut listener: Option<TcpListener> =
+        match TcpListener::bind(("0.0.0.0", actor.sync_port)).await {
+            Ok(l) => {
+                log::info!("sync channel listening on tcp port {}", actor.sync_port);
+                Some(l)
             }
-        }
-    };
-    log::info!("sync channel listening on tcp port {}", actor.sync_port);
+            Err(e) => {
+                log::error!(
+                    "cannot listen on sync port {}: {e} — will keep retrying",
+                    actor.sync_port
+                );
+                None
+            }
+        };
 
     let mut tick = tokio::time::interval(DIAL_INTERVAL);
     loop {
@@ -299,14 +308,24 @@ async fn run_actor(
                 Some(r) => actor.handle_request(r),
                 None => break,
             },
-            accepted = listener.accept() => match accepted {
-                Ok((tcp, addr)) => actor.spawn_accept(tcp, addr.ip()),
-                Err(e) => log::warn!("sync accept failed: {e}"),
-            },
+            accepted = async { listener.as_ref().unwrap().accept().await }, if listener.is_some() => {
+                match accepted {
+                    Ok((tcp, addr)) => actor.spawn_accept(tcp, addr.ip()),
+                    Err(e) => log::warn!("sync accept failed: {e}"),
+                }
+            }
             Some(change) = change_rx.recv() => actor.handle_clip_change(change),
             Some(peers) = peers_rx.recv() => actor.events.send(SyncEvent::PeersDiscovered(peers)),
             Some(internal) = internal_rx.recv() => actor.handle_internal(internal),
-            _ = tick.tick() => actor.tick(),
+            _ = tick.tick() => {
+                if listener.is_none() {
+                    if let Ok(l) = TcpListener::bind(("0.0.0.0", actor.sync_port)).await {
+                        log::info!("sync channel now listening on tcp port {}", actor.sync_port);
+                        listener = Some(l);
+                    }
+                }
+                actor.tick();
+            }
         }
     }
 
@@ -405,6 +424,7 @@ impl Actor {
                     .send(SyncEvent::PairingFailed("pairing window timed out".into()));
             }
         }
+        self.flush_pending_clip();
         self.maybe_dial();
     }
 
@@ -413,6 +433,13 @@ impl Actor {
             return;
         }
         if self.authorized.read().expect("lock").is_empty() {
+            return;
+        }
+        // Don't run ordinary dials while a pairing window is open: the
+        // strict connector wouldn't admit an unpinned peer anyway, but
+        // suppressing dials keeps the pairing exchange the only thing
+        // touching an as-yet-untrusted peer.
+        if self.pairing_open.load(Ordering::SeqCst) {
             return;
         }
         self.dialing = true;
@@ -480,7 +507,15 @@ impl Actor {
                     Err(_) => return,
                 };
                 let (mut r, mut w) = tokio::io::split(stream);
-                match pairing::run_responder(&mut r, &mut w, &exporter, &pin, &device_name).await {
+                // bound the exchange so a stalling peer can't hold a
+                // pairing task open indefinitely
+                let result = tokio::time::timeout(
+                    PAIRING_EXCHANGE_TIMEOUT,
+                    pairing::run_responder(&mut r, &mut w, &exporter, &pin, &device_name),
+                )
+                .await
+                .unwrap_or(Err(pairing::PairingError::UnexpectedMessage));
+                match result {
                     Ok(peer_name) => {
                         let _ = internal.send(Internal::PairingOk {
                             fingerprint: peer_fp,
@@ -503,7 +538,9 @@ impl Actor {
     fn spawn_pair_dial(&mut self, addr: String, pin: String) {
         self.pairing_dial = true;
         self.pairing_open.store(true, Ordering::SeqCst);
-        let connector = self.tls.connector.clone();
+        // the pairing connector admits the not-yet-pinned peer; the PIN
+        // exchange in pair_dial is what establishes trust
+        let connector = self.tls.pairing_connector.clone();
         let internal = self.internal_tx.clone();
         let device_name = self.device_name.clone();
         spawn_local(async move {
@@ -524,7 +561,6 @@ impl Actor {
     }
 
     fn handle_clip_change(&mut self, change: clipboard::Change) {
-        let Some(active) = &self.active else { return };
         let (msg, kind) = match change {
             clipboard::Change::Text(text) => (SyncMessage::ClipText { text }, ClipboardKind::Text),
             clipboard::Change::Image { width, height, png } => (
@@ -532,12 +568,39 @@ impl Actor {
                 ClipboardKind::Image,
             ),
         };
+        self.send_clip(msg, kind);
+    }
+
+    fn send_clip(&mut self, msg: SyncMessage, kind: ClipboardKind) {
+        let Some(active) = &self.active else {
+            // no peer yet: hold the latest change so it syncs on connect
+            self.pending_clip = Some((msg, kind));
+            return;
+        };
         match active.out_tx.try_send(msg) {
-            Ok(()) => self.events.send(SyncEvent::Clipboard {
-                direction: Direction::Sent,
-                kind,
-            }),
-            Err(e) => log::debug!("clipboard not sent (queue busy): {e}"),
+            Ok(()) => {
+                self.pending_clip = None;
+                self.events.send(SyncEvent::Clipboard {
+                    direction: Direction::Sent,
+                    kind,
+                });
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                // queue busy (e.g. mid file transfer): retry on next tick
+                // rather than dropping the copy
+                self.pending_clip = Some((msg, kind));
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.pending_clip = None;
+            }
+        }
+    }
+
+    fn flush_pending_clip(&mut self) {
+        if self.active.is_some() {
+            if let Some((msg, kind)) = self.pending_clip.take() {
+                self.send_clip(msg, kind);
+            }
         }
     }
 
@@ -567,6 +630,11 @@ impl Actor {
                 // both settle on the same TCP stream.
                 let keep_new = match &self.active {
                     None => true,
+                    // A fresh connection from the SAME peer means that
+                    // peer tore down the old link and re-dialed; replace
+                    // it rather than letting the orientation rule keep a
+                    // link the peer has already abandoned.
+                    Some(old) if old.peer_fp == new.peer_fp && old.outbound != new.outbound => true,
                     Some(old) => {
                         let preferred = |c: &ActiveConn| c.outbound == (self.local_fp < c.peer_fp);
                         preferred(&new) || !preferred(old)
@@ -581,6 +649,7 @@ impl Actor {
                         peer_name: Some(new.peer_name.clone()),
                     });
                     self.active = Some(new);
+                    self.flush_pending_clip();
                 } else {
                     new.cancel.cancel();
                 }
@@ -612,15 +681,20 @@ impl Actor {
                 });
             }
             Internal::PairingErr { msg, initiated } => {
-                self.pairing_dial = false;
                 if initiated {
+                    // our own outbound pairing attempt failed
+                    self.pairing_dial = false;
                     self.pairing_open.store(false, Ordering::SeqCst);
+                    self.events.send(SyncEvent::PairingFailed(msg));
                 } else {
-                    // one failed attempt burns the window (no PIN
-                    // brute forcing)
-                    self.close_pairing_window();
+                    // An inbound attempt failed the PIN. Do NOT close the
+                    // window: that would let any unauthenticated LAN host
+                    // cancel the user's pairing by probing a wrong PIN.
+                    // The window still expires on its own timeout, and a
+                    // 6-digit PIN can't be brute-forced within it. Don't
+                    // surface it to the UI either — it's just a probe.
+                    log::warn!("rejected an incoming pairing attempt: {msg}");
                 }
-                self.events.send(SyncEvent::PairingFailed(msg));
             }
             Internal::DialFinished => self.dialing = false,
         }
@@ -675,10 +749,29 @@ async fn pair_dial(
         tls::peer_fingerprint(&stream).ok_or_else(|| "peer sent no certificate".to_string())?;
     let exporter = tls::exporter(&stream).map_err(|e| e.to_string())?;
     let (mut r, mut w) = tokio::io::split(stream);
-    let peer_name = pairing::run_initiator(&mut r, &mut w, &exporter, &pin, &device_name)
-        .await
-        .map_err(|e| e.to_string())?;
+    let peer_name = tokio::time::timeout(
+        PAIRING_EXCHANGE_TIMEOUT,
+        pairing::run_initiator(&mut r, &mut w, &exporter, &pin, &device_name),
+    )
+    .await
+    .map_err(|_| "pairing timed out".to_string())?
+    .map_err(|e| e.to_string())?;
     Ok((peer_fp, peer_name, sock_addr.ip()))
+}
+
+/// Write one frame, bounded by [`WRITE_TIMEOUT`] and raced against
+/// cancellation. Returns false (caller tears down the connection) if the
+/// write fails, times out — a peer that stops reading must never block
+/// the writer forever — or the connection is cancelled mid-write.
+async fn write_framed(
+    w: &mut WriteHalf<TlsStream<TcpStream>>,
+    msg: &SyncMessage,
+    cancel: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        r = tokio::time::timeout(WRITE_TIMEOUT, write_msg(w, msg)) => matches!(r, Ok(Ok(()))),
+    }
 }
 
 async fn run_conn(stream: TlsStream<TcpStream>, outbound: bool, ctx: ConnCtx) {
@@ -724,21 +817,16 @@ async fn run_conn(stream: TlsStream<TcpStream>, outbound: bool, ctx: ConnCtx) {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::select! {
+            let msg = tokio::select! {
                 _ = writer_cancel.cancelled() => break,
                 msg = out_rx.recv() => match msg {
-                    Some(msg) => {
-                        if write_msg(&mut w, &msg).await.is_err() {
-                            break;
-                        }
-                    }
+                    Some(msg) => msg,
                     None => break,
                 },
-                _ = ping.tick() => {
-                    if write_msg(&mut w, &SyncMessage::Ping).await.is_err() {
-                        break;
-                    }
-                }
+                _ = ping.tick() => SyncMessage::Ping,
+            };
+            if !write_framed(&mut w, &msg, &writer_cancel).await {
+                break;
             }
         }
         writer_cancel.cancel();
@@ -801,7 +889,9 @@ async fn reader_loop(
 
         match msg {
             SyncMessage::Ping => {
-                let _ = out_tx.send(SyncMessage::Pong).await;
+                // non-blocking: a peer that floods pings without reading
+                // must not be able to wedge the reader on a full queue
+                let _ = out_tx.try_send(SyncMessage::Pong);
             }
             SyncMessage::Pong | SyncMessage::Hello { .. } => (),
 
@@ -825,6 +915,17 @@ async fn reader_loop(
             }
 
             SyncMessage::FileOffer { id, name, size } => {
+                // reject a reused id rather than orphaning the in-flight
+                // transfer's .vylopart file
+                if recv.contains_key(&id) {
+                    let _ = out_tx
+                        .send(SyncMessage::FileReject {
+                            id,
+                            reason: "transfer id already in use".to_string(),
+                        })
+                        .await;
+                    continue;
+                }
                 let dir = ctx.file_dir.borrow().clone();
                 match files::begin_recv(&dir, &name, size).await {
                     Ok(transfer) => {
@@ -860,6 +961,27 @@ async fn reader_loop(
                 let Some(transfer) = recv.get_mut(&id) else {
                     continue;
                 };
+                // Bound the write by the offered size and per-chunk size:
+                // without this a peer could stream unbounded chunks (or a
+                // huge single frame) and fill the receiver's disk.
+                let overflows = data.len() > proto::CHUNK_SIZE
+                    || transfer.received + data.len() as u64 > transfer.size;
+                if overflows {
+                    let reason = "transfer exceeds offered size".to_string();
+                    ctx.events.send(SyncEvent::Transfer(files::status(
+                        id,
+                        &transfer.name,
+                        Direction::Received,
+                        transfer.received,
+                        transfer.size,
+                        TransferState::Failed,
+                        Some(reason.clone()),
+                    )));
+                    let _ = out_tx.send(SyncMessage::FileCancel { id, reason }).await;
+                    let t = recv.remove(&id).expect("transfer");
+                    let _ = tokio::fs::remove_file(&t.part_path).await;
+                    continue;
+                }
                 if offset != transfer.received {
                     let reason = "chunks out of order".to_string();
                     ctx.events.send(SyncEvent::Transfer(files::status(
@@ -1039,7 +1161,7 @@ mod tests {
             let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
             let stream = TlsStream::Client(
                 tls_a
-                    .connector
+                    .pairing_connector
                     .connect(ServerName::IpAddress(addr.ip().into()), tcp)
                     .await
                     .map_err(|e| e.to_string())?,
@@ -1096,6 +1218,70 @@ mod tests {
         assert!(
             accepted.is_err() || connected.is_err(),
             "handshake must fail when neither side authorized the other"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_connector_rejects_unpinned_peer_during_pairing_window() {
+        // The security-critical property: while a pairing window is
+        // open, the ORDINARY outbound connector must still refuse an
+        // unpinned peer. Only the dedicated pairing connector may admit
+        // one (and only to run the PIN exchange).
+        let (cert_a, auth_a, pairing_a) = test_identity();
+        let (cert_b, auth_b, pairing_b) = test_identity();
+        pairing_a.store(true, Ordering::SeqCst); // window OPEN on the dialer
+        pairing_b.store(true, Ordering::SeqCst);
+        let tls_a = tls::build_tls(&cert_a, auth_a, pairing_a).expect("tls");
+        let tls_b = tls::build_tls(&cert_b, auth_b, pairing_b).expect("tls");
+
+        async fn try_connect(
+            connector: &tokio_rustls::TlsConnector,
+            acceptor: tokio_rustls::TlsAcceptor,
+        ) -> bool {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let accept = async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                acceptor.accept(tcp).await
+            };
+            let connect = async move {
+                let tcp = TcpStream::connect(addr).await.expect("connect");
+                connector
+                    .connect(ServerName::IpAddress(addr.ip().into()), tcp)
+                    .await
+            };
+            let (accepted, connected) = tokio::join!(accept, connect);
+            accepted.is_ok() && connected.is_ok()
+        }
+
+        // strict connector must be refused despite the open window
+        assert!(
+            !try_connect(&tls_a.connector, tls_b.acceptor.clone()).await,
+            "strict outbound connector must reject an unpinned peer even during a pairing window"
+        );
+        // the pairing connector is allowed to establish the TLS session
+        assert!(
+            try_connect(&tls_a.pairing_connector, tls_b.acceptor.clone()).await,
+            "pairing connector should establish the session so the PIN exchange can run"
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_windows_reserved_names() {
+        assert_eq!(files::sanitize_name("NUL"), Some("_NUL".into()));
+        assert_eq!(files::sanitize_name("nul.txt"), Some("_nul.txt".into()));
+        assert_eq!(files::sanitize_name("COM1"), Some("_COM1".into()));
+        assert_eq!(files::sanitize_name("LPT9.pdf"), Some("_LPT9.pdf".into()));
+        assert_eq!(files::sanitize_name("CON"), Some("_CON".into()));
+        // not reserved: COM0, a longer name, a normal file
+        assert_eq!(files::sanitize_name("COM0"), Some("COM0".into()));
+        assert_eq!(
+            files::sanitize_name("communicate.txt"),
+            Some("communicate.txt".into())
+        );
+        assert_eq!(
+            files::sanitize_name("report.pdf"),
+            Some("report.pdf".into())
         );
     }
 

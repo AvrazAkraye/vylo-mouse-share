@@ -565,16 +565,13 @@ impl Config {
             .device_name = Some(name);
     }
 
-    /// set configured clients
+    /// set configured clients. An empty list must round-trip to disk so
+    /// that deleting the last client actually persists (otherwise the
+    /// deleted peer reappears on restart / config reload).
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
-        if self.config_toml.is_none() {
-            self.config_toml = Some(Default::default());
-        }
-        self.config_toml.as_mut().expect("config").clients =
-            Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .clients = Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
     }
 
     /// set authorized keys

@@ -54,14 +54,13 @@ fn confirm_mac(key: &[u8], label: &[u8], exporter: &[u8; 32]) -> [u8; 32] {
 }
 
 fn mac_matches(expected: &[u8; 32], received: &[u8; 32]) -> bool {
-    // constant-time comparison via hmac's verify machinery
-    let mut mac = Hmac::<Sha256>::new_from_slice(expected).expect("hmac accepts any key length");
-    mac.update(b"eq");
-    let a = mac.finalize().into_bytes();
-    let mut mac = Hmac::<Sha256>::new_from_slice(received).expect("hmac accepts any key length");
-    mac.update(b"eq");
-    let b = mac.finalize().into_bytes();
-    a == b
+    // constant-time comparison: fold every byte difference into an
+    // accumulator so the timing does not depend on where a mismatch is
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= expected[i] ^ received[i];
+    }
+    diff == 0
 }
 
 /// Side that dialed after the user typed the PIN ("A").
