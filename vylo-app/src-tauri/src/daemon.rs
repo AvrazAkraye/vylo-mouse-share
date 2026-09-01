@@ -17,6 +17,11 @@ pub fn spawn_daemon() {
     let env = env_logger::Env::default().filter_or("VYLO_LOG_LEVEL", "info");
     let _ = env_logger::Builder::from_env(env).try_init();
 
+    // The Tauri app runs a serviced main dispatch queue, so macOS
+    // keyboard-layout sync can marshal its main-thread-only Text Input
+    // Source calls to it. (The headless daemon must NOT call this.)
+    vylo_mouse_share::set_gui_host();
+
     std::thread::Builder::new()
         .name("vylo-daemon".into())
         .spawn(|| {

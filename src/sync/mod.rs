@@ -56,6 +56,12 @@ fn next_transfer_id() -> u64 {
     NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// See [`crate::set_gui_host`]. Enables macOS keyboard-layout sync, which
+/// must marshal its Text Input Source calls onto the main thread.
+pub(crate) fn set_gui_host() {
+    keyboard::set_host_has_main_loop();
+}
+
 #[derive(Debug)]
 pub(crate) enum SyncRequest {
     StartPairing,

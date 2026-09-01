@@ -25,6 +25,18 @@ use tokio::sync::mpsc::UnboundedSender;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 
+/// Set true by a host that runs a serviced main dispatch queue (the
+/// Tauri app). On macOS the Text Input Source APIs must be called on the
+/// main thread, so the macOS backend only does real work once this is
+/// set; without it (e.g. the headless `vylo daemon`, which never
+/// services the main queue) the backend is a safe no-op instead of
+/// hanging a background thread on a dispatch that never runs.
+pub(crate) static HOST_HAS_MAIN_LOOP: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_host_has_main_loop() {
+    HOST_HAS_MAIN_LOOP.store(true, Ordering::SeqCst);
+}
+
 pub(crate) struct KeyboardMonitor {
     apply_tx: Sender<String>,
 }
@@ -202,7 +214,10 @@ mod macos {
         is_layout && selectable
     }
 
-    pub(crate) fn current_language() -> Option<String> {
+    /// The real TIS read. MUST run on the main thread: on macOS 26 the
+    /// Text Input Source APIs assert `dispatch_assert_queue(main)` and
+    /// abort the process if called off-main.
+    fn real_current_language() -> Option<String> {
         unsafe {
             let src = TISCopyCurrentKeyboardInputSource();
             if src.is_null() {
@@ -214,7 +229,8 @@ mod macos {
         }
     }
 
-    pub(crate) fn select_language(lang: &str) -> bool {
+    /// The real TIS select. MUST run on the main thread (see above).
+    fn real_select_language(lang: &str) -> bool {
         let want = primary_code(lang);
         unsafe {
             let list = TISCreateInputSourceList(std::ptr::null(), 0);
@@ -236,6 +252,76 @@ mod macos {
             CFRelease(list as CFTypeRef);
             selected
         }
+    }
+
+    /* ---- run the TIS calls on the main dispatch queue ---- */
+
+    #[link(name = "System", kind = "dylib")]
+    unsafe extern "C" {
+        fn dispatch_sync_f(
+            queue: *const c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+        static _dispatch_main_q: c_void;
+    }
+
+    fn main_queue() -> *const c_void {
+        unsafe { &_dispatch_main_q as *const c_void }
+    }
+
+    struct ReadCtx {
+        result: Option<String>,
+    }
+    extern "C" fn read_trampoline(ctx: *mut c_void) {
+        let ctx = unsafe { &mut *(ctx as *mut ReadCtx) };
+        ctx.result = real_current_language();
+    }
+
+    struct SelectCtx {
+        lang: String,
+        ok: bool,
+    }
+    extern "C" fn select_trampoline(ctx: *mut c_void) {
+        let ctx = unsafe { &mut *(ctx as *mut SelectCtx) };
+        ctx.ok = real_select_language(&ctx.lang);
+    }
+
+    pub(crate) fn current_language() -> Option<String> {
+        // Only when the host services the main queue (the Tauri app);
+        // otherwise dispatch_sync_f would block forever.
+        if !super::HOST_HAS_MAIN_LOOP.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let mut ctx = ReadCtx { result: None };
+        // dispatch_sync_f blocks until the work completes on the main
+        // thread, so `ctx` stays valid throughout — no use-after-free.
+        unsafe {
+            dispatch_sync_f(
+                main_queue(),
+                &mut ctx as *mut _ as *mut c_void,
+                read_trampoline,
+            );
+        }
+        ctx.result
+    }
+
+    pub(crate) fn select_language(lang: &str) -> bool {
+        if !super::HOST_HAS_MAIN_LOOP.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let mut ctx = SelectCtx {
+            lang: lang.to_string(),
+            ok: false,
+        };
+        unsafe {
+            dispatch_sync_f(
+                main_queue(),
+                &mut ctx as *mut _ as *mut c_void,
+                select_trampoline,
+            );
+        }
+        ctx.ok
     }
 }
 
