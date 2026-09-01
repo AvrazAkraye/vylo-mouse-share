@@ -1,0 +1,76 @@
+# Vylo Mouse Share — Setup
+
+Two machines, one wired LAN, one mouse + keyboard, shared clipboard, file drops.
+
+## 1. Install
+
+### macOS
+1. Open the `.dmg` and drag **Vylo Mouse Share** to Applications.
+2. The app is unsigned, so the first launch needs: **right-click the app → Open → Open**
+   (or approve it under *System Settings → Privacy & Security*).
+3. On first run macOS will ask for two permissions — both are required for input sharing:
+   - **Accessibility** (to move the cursor and type on this machine)
+   - **Input Monitoring** (to capture the mouse/keyboard when you switch screens)
+   Grant them under *System Settings → Privacy & Security*, then use the app's
+   re-enable buttons (or restart the app).
+
+### Windows
+1. Run the `.exe` installer (NSIS). SmartScreen may warn because it's unsigned —
+   *More info → Run anyway*.
+2. No special permissions are needed on Windows.
+3. If Windows Firewall asks, allow Vylo on **private networks** (it needs UDP 4242 and
+   TCP 4243 on the LAN).
+
+## 2. Pair the two machines (once, under a minute)
+
+1. Start Vylo on both machines.
+2. On machine A open the **Pairing** screen and press **Show PIN** — a 6-digit PIN
+   appears and A waits for a peer (2-minute window).
+3. On machine B the **Pairing** screen lists nearby devices (via mDNS). Click **Pair**
+   next to machine A and type the PIN.
+   - If discovery doesn't show the peer (some networks block multicast), use
+     **Pair by address** with A's IP and sync port, e.g. `192.168.1.20:4243`.
+4. Done. Both machines now trust exactly each other (certificate fingerprints are
+   pinned on both sides); everything is encrypted end-to-end. The wrong PIN burns the
+   window — press Show PIN again to retry.
+
+## 3. Arrange the screens
+
+Open **Layout** and drag the peer's screen to whichever side it physically sits on
+(left/right/top/bottom). Default after pairing: the machine where you typed the PIN
+treats the other one as being on its **left**.
+
+Move the cursor off that screen edge and it crosses over; move it back the opposite
+edge to return. Stuck? Press **Ctrl+Shift+Alt/Option+Meta/Cmd** (the release bind) to
+yank the cursor back.
+
+## 4. Clipboard
+
+On by default — copy text or an image on one machine, paste on the other. Toggle it
+from the tray/menu-bar icon or the Status screen.
+
+## 5. Send files
+
+Either drag files onto the Vylo window (drop overlay appears), or click **Send files…**
+on the Status screen. Files land on the other machine in `~/Downloads/VyloShare`
+(configurable in Settings), integrity-checked with sha256; incomplete or corrupted
+transfers are discarded, never half-written into your folder.
+
+## 6. Everyday use
+
+Vylo lives in the menu bar (macOS) / system tray (Windows): connection status,
+clipboard toggle, received-files folder, quit. Closing the window hides it — the app
+keeps running. Enable **Start on login** in Settings on both machines and forget it.
+
+## Known limitations
+
+- Both machines must use the same sync port (default 4243); change it in
+  `config.toml` (`sync_port`) on both if it collides with something.
+- Folders can't be sent directly — zip them first.
+- Clipboard sync covers text and images (not files-on-clipboard or rich text).
+- Very large clipboard images sync with a short delay (they are PNG-encoded).
+- A receiving Windows machine with no physical mouse attached may hide its cursor
+  until a mouse is plugged in once (Windows quirk inherited from upstream).
+- Unsigned builds: Gatekeeper/SmartScreen prompts on first launch (see above).
+- The config file lives at `~/.config/vylo/config.toml` (macOS/Linux) or
+  `%LOCALAPPDATA%\vylo\config.toml` (Windows).

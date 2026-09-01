@@ -41,21 +41,21 @@ pub fn local_commit() -> [u8; 8] {
 }
 
 const CONFIG_FILE_NAME: &str = "config.toml";
-const CERT_FILE_NAME: &str = "lan-mouse.pem";
+const CERT_FILE_NAME: &str = "vylo.pem";
 
 fn default_path() -> Result<PathBuf, VarError> {
     #[cfg(unix)]
     let default_path = {
         let xdg_config_home =
             env::var("XDG_CONFIG_HOME").unwrap_or(format!("{}/.config", env::var("HOME")?));
-        format!("{xdg_config_home}/lan-mouse/")
+        format!("{xdg_config_home}/vylo/")
     };
 
     #[cfg(not(unix))]
     let default_path = {
         let app_data =
             env::var("LOCALAPPDATA").unwrap_or(format!("{}/.config", env::var("USERPROFILE")?));
-        format!("{app_data}\\lan-mouse\\")
+        format!("{app_data}\\vylo\\")
     };
     Ok(PathBuf::from(default_path))
 }
@@ -69,6 +69,10 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    clipboard_sync: Option<bool>,
+    file_dir: Option<PathBuf>,
+    sync_port: Option<u16>,
+    device_name: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -340,8 +344,16 @@ const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
 
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
-        let args = Args::parse();
+        Self::with_args(Args::parse())
+    }
 
+    /// Config for embedding the service in another process (e.g. the
+    /// Vylo desktop app): ignores the host process's command line.
+    pub fn embedded() -> Result<Self, ConfigError> {
+        Self::with_args(Args::parse_from(["vylo"]))
+    }
+
+    fn with_args(args: Args) -> Result<Self, ConfigError> {
         // --config <file> overrules default location
         let config_path = args
             .config
@@ -492,6 +504,65 @@ impl Config {
             .as_ref()
             .and_then(|c| c.release_bind.clone())
             .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
+    }
+
+    /// whether clipboard contents are synced to the paired peer
+    pub fn clipboard_sync(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard_sync)
+            .unwrap_or(true)
+    }
+
+    pub fn set_clipboard_sync(&mut self, enabled: bool) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .clipboard_sync = Some(enabled);
+    }
+
+    /// directory incoming files are written to
+    pub fn file_dir(&self) -> PathBuf {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.file_dir.clone())
+            .unwrap_or_else(|| {
+                dirs::download_dir()
+                    .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+                    .join("VyloShare")
+            })
+    }
+
+    pub fn set_file_dir(&mut self, dir: PathBuf) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .file_dir = Some(dir);
+    }
+
+    /// TCP port of the clipboard / file-transfer side channel
+    pub fn sync_port(&self) -> u16 {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.sync_port)
+            .unwrap_or(lan_mouse_ipc::DEFAULT_SYNC_PORT)
+    }
+
+    /// human readable name of this device, shown on the peer
+    pub fn device_name(&self) -> String {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.device_name.clone())
+            .unwrap_or_else(|| {
+                gethostname::gethostname()
+                    .to_string_lossy()
+                    .trim_end_matches(".local")
+                    .to_string()
+            })
+    }
+
+    pub fn set_device_name(&mut self, name: String) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .device_name = Some(name);
     }
 
     /// set configured clients

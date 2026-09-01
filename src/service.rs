@@ -7,6 +7,7 @@ use crate::{
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
+    sync::{SyncEvent, SyncOptions, SyncRequest, VyloSync},
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
@@ -18,6 +19,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
@@ -67,6 +69,11 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// clipboard / file-transfer / pairing side channel
+    sync: VyloSync,
+    /// last reported state of the sync channel
+    sync_connected: bool,
+    sync_peer_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -94,7 +101,23 @@ impl Service {
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let conn = LanMouseConnection::new(
+            cert.clone(),
+            authorized_keys.clone(),
+            client_manager.clone(),
+        );
+
+        // clipboard / file / pairing side channel
+        let sync = VyloSync::new(
+            cert.clone(),
+            authorized_keys.clone(),
+            SyncOptions {
+                sync_port: config.sync_port(),
+                clipboard_sync: config.clipboard_sync(),
+                file_dir: config.file_dir(),
+                device_name: config.device_name(),
+            },
+        );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -123,6 +146,9 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            sync,
+            sync_connected: false,
+            sync_peer_name: None,
         };
         Ok(service)
     }
@@ -140,6 +166,15 @@ impl Service {
             self.activate_client(handle);
         }
 
+        // seed the sync channel with known peer addresses
+        for handle in self.client_manager.registered_clients() {
+            if let Some(ips) = self.client_manager.get_ips(handle) {
+                for ip in ips {
+                    self.sync.request(SyncRequest::AddrHint(ip));
+                }
+            }
+        }
+
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
@@ -147,6 +182,7 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = self.sync.event() => self.handle_sync_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -159,6 +195,8 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("terminating sync channel ...");
+        self.sync.terminate().await;
 
         Ok(())
     }
@@ -215,7 +253,119 @@ impl Service {
                 self.update_enter_hook(handle, enter_hook)
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::StartPairing => self.sync.request(SyncRequest::StartPairing),
+            FrontendRequest::PairWithPeer { addr, pin } => {
+                self.sync.request(SyncRequest::PairWithPeer { addr, pin })
+            }
+            FrontendRequest::CancelPairing => self.sync.request(SyncRequest::CancelPairing),
+            FrontendRequest::SendFiles(paths) => self.sync.request(SyncRequest::SendFiles(
+                paths.into_iter().map(PathBuf::from).collect(),
+            )),
+            FrontendRequest::SetClipboardSync(enabled) => {
+                self.config.set_clipboard_sync(enabled);
+                self.sync.request(SyncRequest::SetClipboardSync(enabled));
+                self.save_config();
+                self.broadcast_vylo_state();
+            }
+            FrontendRequest::SetFileDir(dir) => {
+                let dir = PathBuf::from(dir);
+                self.config.set_file_dir(dir.clone());
+                self.sync.request(SyncRequest::SetFileDir(dir));
+                self.save_config();
+                self.broadcast_vylo_state();
+            }
+            FrontendRequest::SetDeviceName(name) => {
+                self.config.set_device_name(name.clone());
+                self.sync.request(SyncRequest::SetDeviceName(name));
+                self.save_config();
+                self.broadcast_vylo_state();
+            }
         }
+    }
+
+    fn handle_sync_event(&mut self, event: SyncEvent) {
+        match event {
+            SyncEvent::Status {
+                connected,
+                peer_name,
+            } => {
+                self.sync_connected = connected;
+                self.sync_peer_name = peer_name.clone();
+                self.notify_frontend(FrontendEvent::SyncStatus {
+                    connected,
+                    peer_name,
+                });
+            }
+            SyncEvent::PairingStarted { pin, port } => {
+                self.notify_frontend(FrontendEvent::PairingStarted { pin, port })
+            }
+            SyncEvent::PairingComplete {
+                fingerprint,
+                name,
+                addr,
+                initiated,
+            } => {
+                self.add_authorized_key(name.clone(), fingerprint.clone());
+                self.ensure_paired_client(&name, addr, initiated);
+                self.save_config();
+                self.notify_frontend(FrontendEvent::PairingComplete { fingerprint, name });
+            }
+            SyncEvent::PairingFailed(msg) => {
+                self.notify_frontend(FrontendEvent::PairingFailed(msg))
+            }
+            SyncEvent::PeersDiscovered(peers) => {
+                self.notify_frontend(FrontendEvent::PeersDiscovered(peers))
+            }
+            SyncEvent::Clipboard { direction, kind } => {
+                self.notify_frontend(FrontendEvent::ClipboardSynced { direction, kind })
+            }
+            SyncEvent::Transfer(status) => {
+                self.notify_frontend(FrontendEvent::FileTransfer(status))
+            }
+        }
+    }
+
+    /// after pairing: make sure the peer exists as a client so the
+    /// input channel connects without any further setup
+    fn ensure_paired_client(&mut self, name: &str, addr: IpAddr, initiated: bool) {
+        for handle in self.client_manager.registered_clients() {
+            if let Some((c, _)) = self.client_manager.get_state(handle) {
+                if c.fix_ips.contains(&addr) || c.hostname.as_deref() == Some(name) {
+                    self.activate_client(handle);
+                    self.broadcast_client(handle);
+                    return;
+                }
+            }
+        }
+        // the machine where the PIN was typed places the peer on the
+        // left, the machine that showed the PIN on the right — a
+        // consistent mirrored default, adjustable in the layout screen
+        let pos = if initiated {
+            Position::Left
+        } else {
+            Position::Right
+        };
+        let handle = self.client_manager.add_with_config(ConfigClient {
+            ips: HashSet::from([addr]),
+            hostname: Some(name.to_string()),
+            port: lan_mouse_ipc::DEFAULT_PORT,
+            pos,
+            active: false,
+            enter_hook: None,
+        });
+        if let Some((c, s)) = self.client_manager.get_state(handle) {
+            self.notify_frontend(FrontendEvent::Created(handle, c, s));
+        }
+        self.activate_client(handle);
+    }
+
+    fn broadcast_vylo_state(&mut self) {
+        self.notify_frontend(FrontendEvent::VyloState {
+            clipboard_sync: self.config.clipboard_sync(),
+            file_dir: self.config.file_dir().display().to_string(),
+            device_name: self.config.device_name(),
+            sync_port: self.config.sync_port(),
+        });
     }
 
     fn save_config(&mut self) {
@@ -260,6 +410,12 @@ impl Service {
             .write()
             .unwrap()
             .clone_from(&authorized_keys);
+        self.sync
+            .request(SyncRequest::SetClipboardSync(self.config.clipboard_sync()));
+        self.sync
+            .request(SyncRequest::SetFileDir(self.config.file_dir()));
+        self.sync
+            .request(SyncRequest::SetDeviceName(self.config.device_name()));
         self.sync_frontend();
     }
 
@@ -279,6 +435,7 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                self.sync.request(SyncRequest::AddrHint(addr.ip()));
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
@@ -314,6 +471,7 @@ impl Service {
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::Connected { addr, fingerprint } => {
+                self.sync.request(SyncRequest::AddrHint(addr.ip()));
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello { addr, commit } => {
@@ -366,6 +524,9 @@ impl Service {
                     log::warn!("could not resolve {hostname}: {e}");
                 }
                 let ips = ips.unwrap_or_default();
+                for ip in ips.iter() {
+                    self.sync.request(SyncRequest::AddrHint(*ip));
+                }
                 self.client_manager.set_dns_ips(handle, ips);
                 handle
             }
@@ -389,6 +550,11 @@ impl Service {
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.broadcast_vylo_state();
+        self.notify_frontend(FrontendEvent::SyncStatus {
+            connected: self.sync_connected,
+            peer_name: self.sync_peer_name.clone(),
+        });
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;

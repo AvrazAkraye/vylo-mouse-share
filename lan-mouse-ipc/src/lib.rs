@@ -57,6 +57,8 @@ pub enum IpcError {
 }
 
 pub const DEFAULT_PORT: u16 = 4242;
+/// TCP port of the clipboard / file-transfer / pairing side channel
+pub const DEFAULT_SYNC_PORT: u16 = 4243;
 
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -223,6 +225,74 @@ pub enum FrontendEvent {
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
+    /// a pairing window was opened on this device
+    PairingStarted { pin: String, port: u16 },
+    /// pairing finished successfully (either side)
+    PairingComplete { fingerprint: String, name: String },
+    /// pairing failed or was cancelled
+    PairingFailed(String),
+    /// devices discovered on the LAN via mdns (full list, replaces previous)
+    PeersDiscovered(Vec<DiscoveredPeer>),
+    /// state of the clipboard/file side channel
+    SyncStatus {
+        connected: bool,
+        peer_name: Option<String>,
+    },
+    /// vylo settings state (part of initial sync)
+    VyloState {
+        clipboard_sync: bool,
+        file_dir: String,
+        device_name: String,
+        sync_port: u16,
+    },
+    /// a clipboard item was relayed
+    ClipboardSynced {
+        direction: Direction,
+        kind: ClipboardKind,
+    },
+    /// file transfer progress
+    FileTransfer(FileTransferStatus),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveredPeer {
+    pub name: String,
+    pub addrs: Vec<IpAddr>,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    Sent,
+    Received,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardKind {
+    Text,
+    Image,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferState {
+    Active,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileTransferStatus {
+    pub id: u64,
+    pub name: String,
+    pub direction: Direction,
+    pub transferred: u64,
+    pub total: u64,
+    pub state: TransferState,
+    /// destination path when done (received), error message when failed
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -261,6 +331,21 @@ pub enum FrontendRequest {
     UpdateEnterHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// open a pairing window: daemon generates a PIN and accepts one
+    /// pairing attempt for a limited time
+    StartPairing,
+    /// pair with a peer that is showing a PIN
+    PairWithPeer { addr: String, pin: String },
+    /// close the pairing window / abort a pairing attempt
+    CancelPairing,
+    /// send files to the paired peer
+    SendFiles(Vec<String>),
+    /// enable / disable clipboard sync
+    SetClipboardSync(bool),
+    /// set the directory incoming files are written to
+    SetFileDir(String),
+    /// set this device's name
+    SetDeviceName(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -280,7 +365,7 @@ impl From<Status> for bool {
 }
 
 #[cfg(unix)]
-const LAN_MOUSE_SOCKET_NAME: &str = "lan-mouse-socket.sock";
+const LAN_MOUSE_SOCKET_NAME: &str = "vylo-socket.sock";
 
 #[derive(Debug, Error)]
 pub enum SocketPathError {

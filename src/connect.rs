@@ -1,5 +1,6 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
+use crate::crypto;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -9,7 +10,7 @@ use std::{
     io,
     net::SocketAddr,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use thiserror::Error;
@@ -46,6 +47,7 @@ const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
+    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     let conn = Arc::new(
@@ -54,10 +56,39 @@ async fn connect(
             .map_err(|e| (addr, e.into()))?,
     );
     conn.connect(addr).await.map_err(|e| (addr, e.into()))?;
+    // The peer uses a self-signed certificate, so chain verification
+    // is skipped (insecure_skip_verify) — but the callback below still
+    // runs and pins the peer to the authorized-fingerprints allowlist.
+    // Without it, anything on the LAN could impersonate the peer and
+    // receive our input events.
+    let verify_peer_certificate = {
+        let authorized_keys = authorized_keys.clone();
+        Some(Arc::new(
+            move |certs: &[Vec<u8>], _chains: &[rustls::pki_types::CertificateDer<'static>]| {
+                let fingerprint = match certs.first() {
+                    Some(c) => crypto::generate_fingerprint(c),
+                    None => return Err(webrtc_dtls::Error::ErrVerifyDataMismatch),
+                };
+                if authorized_keys
+                    .read()
+                    .expect("lock")
+                    .contains_key(&fingerprint)
+                {
+                    Ok(())
+                } else {
+                    log::warn!(
+                        "refusing to connect to {addr}: unauthorized fingerprint {fingerprint} (pair the devices first)"
+                    );
+                    Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+                }
+            },
+        ) as _)
+    };
     let config = Config {
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
         insecure_skip_verify: true,
+        verify_peer_certificate,
         extended_master_secret: ExtendedMasterSecretType::Require,
         ..Default::default()
     };
@@ -74,10 +105,11 @@ async fn connect(
 async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
+    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
     let mut joinset = JoinSet::new();
     for &addr in addrs {
-        joinset.spawn_local(connect(addr, cert.clone()));
+        joinset.spawn_local(connect(addr, cert.clone(), authorized_keys.clone()));
     }
     loop {
         match joinset.join_next().await {
@@ -94,6 +126,7 @@ async fn connect_any(
 
 pub(crate) struct LanMouseConnection {
     cert: Certificate,
+    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
@@ -103,10 +136,15 @@ pub(crate) struct LanMouseConnection {
 }
 
 impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
+    pub(crate) fn new(
+        cert: Certificate,
+        authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+        client_manager: ClientManager,
+    ) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
             cert,
+            authorized_keys,
             client_manager,
             conns: Default::default(),
             connecting: Default::default(),
@@ -156,6 +194,7 @@ impl LanMouseConnection {
             spawn_local(connect_to_handle(
                 self.client_manager.clone(),
                 self.cert.clone(),
+                self.authorized_keys.clone(),
                 handle,
                 self.conns.clone(),
                 self.connecting.clone(),
@@ -170,6 +209,7 @@ impl LanMouseConnection {
 async fn connect_to_handle(
     client_manager: ClientManager,
     cert: Certificate,
+    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     handle: ClientHandle,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
@@ -185,7 +225,7 @@ async fn connect_to_handle(
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let res = connect_any(&addrs, cert).await;
+        let res = connect_any(&addrs, cert, authorized_keys).await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
