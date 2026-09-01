@@ -62,6 +62,16 @@ pub(crate) fn set_gui_host() {
     keyboard::set_host_has_main_loop();
 }
 
+/// Orientation tie-break for simultaneous connects: a machine "prefers"
+/// a connection whose direction matches its role as the designated
+/// dialer (the machine with the smaller fingerprint dials). Both ends
+/// compute this identically from the same two fingerprints, so they
+/// always converge on the same connection — never cancelling the one
+/// the other keeps.
+fn orientation_prefers(local_fp: &str, outbound: bool, peer_fp: &str) -> bool {
+    outbound == (local_fp < peer_fp)
+}
+
 #[derive(Debug)]
 pub(crate) enum SyncRequest {
     StartPairing,
@@ -235,6 +245,9 @@ struct Actor {
     pending_clip: Option<(SyncMessage, ClipboardKind)>,
     /// a local keyboard-language change awaiting a free queue slot
     pending_layout: Option<String>,
+    /// last sync status broadcast to frontends; used to suppress
+    /// duplicate events so the UI does not flicker
+    last_sync_status: Option<(bool, Option<String>)>,
     conn_seq: u64,
     candidates: HashSet<IpAddr>,
     dialing: bool,
@@ -297,6 +310,7 @@ async fn run_actor(
         active: None,
         pending_clip: None,
         pending_layout: None,
+        last_sync_status: None,
         conn_seq: 0,
         candidates: HashSet::new(),
         dialing: false,
@@ -664,6 +678,20 @@ impl Actor {
         }
     }
 
+    /// Emit a sync-status change only when it actually changes, so the
+    /// frontend never flickers on repeated identical states.
+    fn emit_sync_status(&mut self, connected: bool, peer_name: Option<String>) {
+        let status = (connected, peer_name);
+        if self.last_sync_status.as_ref() == Some(&status) {
+            return;
+        }
+        self.last_sync_status = Some(status.clone());
+        self.events.send(SyncEvent::Status {
+            connected: status.0,
+            peer_name: status.1,
+        });
+    }
+
     fn handle_internal(&mut self, internal: Internal) {
         match internal {
             Internal::Established {
@@ -685,30 +713,35 @@ impl Actor {
                     cancel,
                 };
                 // Both machines may connect to each other at once. Keep
-                // the connection initiated by the machine with the
-                // smaller fingerprint — deterministic on both ends, so
-                // both settle on the same TCP stream.
+                // the connection whose direction the orientation rule
+                // prefers — the machine with the smaller fingerprint is
+                // the designated dialer. Both ends compute this
+                // identically, so they converge on the SAME TCP stream
+                // without either cancelling the one the other keeps.
+                //
+                // Do NOT special-case "same peer, other direction" as a
+                // re-dial: during a simultaneous connect that makes each
+                // side cancel the exact connection the other is keeping,
+                // so both die and both redial forever (the offline<->
+                // connected "flapping" loop). A genuinely dead peer link
+                // is reaped by the write/ping timeouts instead, after
+                // which a fresh dial is accepted via the `None` arm.
                 let keep_new = match &self.active {
                     None => true,
-                    // A fresh connection from the SAME peer means that
-                    // peer tore down the old link and re-dialed; replace
-                    // it rather than letting the orientation rule keep a
-                    // link the peer has already abandoned.
-                    Some(old) if old.peer_fp == new.peer_fp && old.outbound != new.outbound => true,
                     Some(old) => {
-                        let preferred = |c: &ActiveConn| c.outbound == (self.local_fp < c.peer_fp);
-                        preferred(&new) || !preferred(old)
+                        let prefers = |c: &ActiveConn| {
+                            orientation_prefers(&self.local_fp, c.outbound, &c.peer_fp)
+                        };
+                        prefers(&new) || !prefers(old)
                     }
                 };
                 if keep_new {
                     if let Some(old) = self.active.take() {
                         old.cancel.cancel();
                     }
-                    self.events.send(SyncEvent::Status {
-                        connected: true,
-                        peer_name: Some(new.peer_name.clone()),
-                    });
+                    let peer_name = new.peer_name.clone();
                     self.active = Some(new);
+                    self.emit_sync_status(true, Some(peer_name));
                     self.flush_pending_clip();
                     self.flush_pending_layout();
                 } else {
@@ -718,10 +751,7 @@ impl Actor {
             Internal::ConnClosed { id } => {
                 if self.active.as_ref().is_some_and(|a| a.id == id) {
                     self.active = None;
-                    self.events.send(SyncEvent::Status {
-                        connected: false,
-                        peer_name: None,
-                    });
+                    self.emit_sync_status(false, None);
                 }
             }
             Internal::PairingOk {
@@ -1393,6 +1423,35 @@ mod tests {
             read_msg(&mut b).await,
             Err(proto::ProtoError::FrameTooLarge(_))
         ));
+    }
+
+    #[test]
+    fn tie_break_converges_and_does_not_flap() {
+        // Two machines, fingerprints A and B, each end up with an
+        // outbound and an inbound connection to the other. Whatever the
+        // order the two connections arrive in, BOTH machines must settle
+        // on the same physical link (A's outbound == B's inbound), or the
+        // channel flaps offline<->connected forever.
+        for (a, b) in [
+            ("aaaa", "bbbb"),
+            ("bbbb", "aaaa"),
+            ("00", "ff"),
+            ("de:ad", "be:ef"),
+        ] {
+            // The connection each machine keeps, given it has seen both
+            // directions (prefers-outbound decides which it keeps).
+            let a_keeps_outbound = orientation_prefers(a, true, b);
+            let b_keeps_outbound = orientation_prefers(b, true, a);
+            // A's outbound is B's inbound. Convergence on ONE link means
+            // exactly one machine keeps its outbound and the other keeps
+            // its inbound — i.e. their "keep outbound" answers differ.
+            assert_ne!(
+                a_keeps_outbound, b_keeps_outbound,
+                "machines {a}/{b} would each keep the link the other cancels -> flap loop"
+            );
+            // And the keeper must be the smaller-fingerprint dialer.
+            assert_eq!(a_keeps_outbound, a < b);
+        }
     }
 
     #[test]
