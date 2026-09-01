@@ -37,21 +37,19 @@ jobs:
           - os: macos-14
             bundles: dmg
             artifact: vylo-macos-arm64
+            # vylo-app is a workspace member, so Tauri bundles land in
+            # the workspace-root target/, not vylo-app/src-tauri/target/
             path: |
-              vylo-app/src-tauri/target/release/bundle/dmg/*.dmg
+              target/release/bundle/dmg/*.dmg
           - os: windows-latest
             bundles: nsis
             artifact: vylo-windows-x64
             path: |
-              vylo-app/src-tauri/target/release/bundle/nsis/*.exe
+              target/release/bundle/nsis/*.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            .
-            vylo-app/src-tauri
       - uses: actions/setup-node@v4
         with:
           node-version: 20
