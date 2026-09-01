@@ -560,9 +560,16 @@ impl Config {
     }
 
     pub fn set_device_name(&mut self, name: String) {
+        // an empty / whitespace name would show up blank on the peer;
+        // fall back to the OS hostname default instead of storing it
+        let name = name.trim();
         self.config_toml
             .get_or_insert_with(Default::default)
-            .device_name = Some(name);
+            .device_name = if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        };
     }
 
     /// set configured clients. An empty list must round-trip to disk so

@@ -72,16 +72,16 @@ fn fingerprint_text(text: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// cheap image fingerprint: dimensions, length and a prefix of the
-/// pixel data — enough to detect change without hashing 30 MB every
-/// poll
+/// full image fingerprint: dimensions plus every pixel. Reading the
+/// image off the clipboard is already a full copy, so hashing all of it
+/// is cheap relative to that and — unlike a prefix hash — never misses a
+/// change that differs only late in the image.
 fn fingerprint_image(width: usize, height: usize, rgba: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"image");
     h.update((width as u64).to_le_bytes());
     h.update((height as u64).to_le_bytes());
-    h.update((rgba.len() as u64).to_le_bytes());
-    h.update(&rgba[..rgba.len().min(64 * 1024)]);
+    h.update(rgba);
     h.finalize().into()
 }
 
