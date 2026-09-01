@@ -1323,9 +1323,15 @@ mod tests {
             Some("passwd".into())
         );
         assert_eq!(files::sanitize_name("/etc/passwd"), Some("passwd".into()));
+        // both separators are stripped on every OS, so a windows-style
+        // path reduces to its basename regardless of receiver platform
         assert_eq!(
             files::sanitize_name("C:\\Windows\\evil.exe"),
-            Some("C__Windows_evil.exe".into())
+            Some("evil.exe".into())
+        );
+        assert_eq!(
+            files::sanitize_name("..\\..\\secret"),
+            Some("secret".into())
         );
         assert_eq!(
             files::sanitize_name("report.pdf"),

@@ -44,13 +44,15 @@ pub(crate) fn status(
 
 /// Reduce an offered file name to a safe basename: no directories, no
 /// parent traversal, no characters that are invalid on the receiving
-/// platform.
+/// platform. Splits on BOTH `/` and `\` regardless of the host OS (not
+/// `Path::file_name`, which treats `\` as a separator only on Windows),
+/// so a name crafted on either platform is reduced the same way.
 pub(crate) fn sanitize_name(offered: &str) -> Option<String> {
-    let name = Path::new(offered)
-        .file_name()?
-        .to_string_lossy()
-        .to_string();
-    let name: String = name
+    let base = offered
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(offered);
+    let name: String = base
         .chars()
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
