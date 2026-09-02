@@ -107,7 +107,9 @@ export type DaemonEvent =
   | { type: "SyncStatus"; status: SyncStatus }
   | { type: "VyloState"; state: VyloState }
   | { type: "ClipboardSynced"; info: ClipboardSynced }
-  | { type: "FileTransfer"; transfer: FileTransfer };
+  | { type: "FileTransfer"; transfer: FileTransfer }
+  /** files dragged across from the peer landed here (final paths) */
+  | { type: "FilesDropped"; paths: string[] };
 
 /**
  * Parse one raw JSON line from the daemon into a typed event.
@@ -185,6 +187,8 @@ export function parseDaemonEvent(raw: string): DaemonEvent | null {
         return { type: "ClipboardSynced", info: p };
       case "FileTransfer":
         return { type: "FileTransfer", transfer: p };
+      case "FilesDropped":
+        return { type: "FilesDropped", paths: p.paths ?? [] };
       default:
         return null;
     }

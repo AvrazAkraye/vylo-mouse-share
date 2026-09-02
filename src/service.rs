@@ -330,6 +330,9 @@ impl Service {
             SyncEvent::Transfer(status) => {
                 self.notify_frontend(FrontendEvent::FileTransfer(status))
             }
+            SyncEvent::DragDropped { paths } => self.notify_frontend(FrontendEvent::FilesDropped {
+                paths: paths.iter().map(|p| p.display().to_string()).collect(),
+            }),
         }
     }
 
@@ -529,6 +532,29 @@ impl Service {
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle);
+                // Cross-machine drag-and-drop: if the pointer crossed while
+                // the user is mid-drag of files, carry them over. Only when
+                // the side channel is up — otherwise there is nothing to
+                // ship the files through, so don't arm the drop detector.
+                if self.sync_connected {
+                    let paths = input_capture::active_drag_files();
+                    if !paths.is_empty() {
+                        log::info!(
+                            "file drag ({} item(s)) crossed to client {handle}",
+                            paths.len()
+                        );
+                        self.sync.request(SyncRequest::DragFiles(paths));
+                        self.capture.set_drag_pending(true);
+                    }
+                }
+            }
+            ICaptureEvent::DragReleased(handle) => {
+                log::info!("drop on client {handle}");
+                self.sync.request(SyncRequest::DragDrop);
+            }
+            ICaptureEvent::DragCancelled(handle) => {
+                log::info!("drag to client {handle} cancelled");
+                self.sync.request(SyncRequest::DragCancel);
             }
         }
     }

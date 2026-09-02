@@ -8,7 +8,7 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{BTN_LEFT, Event, KeyboardEvent, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -37,6 +37,12 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    /// the left button was released on the peer while a file drag that
+    /// crossed to it was pending — i.e. the user dropped
+    DragReleased(u64),
+    /// the capture was released (pointer came back, release bind, error)
+    /// while a file drag was pending — i.e. the drag was cancelled
+    DragCancelled(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +67,8 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// a file drag crossed to the active client; watch for its release
+    SetDragPending(bool),
 }
 
 impl Capture {
@@ -74,6 +82,7 @@ impl Capture {
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
+            drag_pending: false,
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -137,6 +146,14 @@ impl Capture {
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
+
+    /// arm/disarm drag tracking: while pending, the forwarded left-button
+    /// release is reported as a drop and a capture release as a cancel
+    pub(crate) fn set_drag_pending(&self, pending: bool) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SetDragPending(pending));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -158,6 +175,9 @@ macro_rules! debounce {
 
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
+    /// a file drag crossed to `active_client` and has not yet been
+    /// dropped or cancelled
+    drag_pending: bool,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -214,6 +234,7 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        CaptureRequest::SetDragPending(p) => self.drag_pending = p,
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -307,6 +328,7 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
+                    CaptureRequest::SetDragPending(p) => self.drag_pending = p,
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -354,6 +376,25 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
+        // A file drag that crossed to this client ends on left-button
+        // release: that's the drop. The release itself is still forwarded
+        // below (the peer never saw the press, so it's a harmless orphan).
+        if self.drag_pending
+            && matches!(
+                event,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                    button: BTN_LEFT,
+                    state: 0,
+                    ..
+                }))
+            )
+        {
+            self.drag_pending = false;
+            self.event_tx
+                .send(ICaptureEvent::DragReleased(handle))
+                .expect("channel closed");
+        }
+
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
@@ -368,6 +409,11 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+            // this release path bypasses release_capture(); don't leave a
+            // stale pending drag that could fire a spurious drop later
+            if std::mem::take(&mut self.drag_pending) {
+                let _ = self.event_tx.send(ICaptureEvent::DragCancelled(handle));
+            }
             capture.release().await?;
         }
         Ok(())
@@ -376,6 +422,12 @@ impl CaptureTask {
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            // the pointer came back (peer Leave), the release bind fired, or
+            // the service asked us to release — before the drop happened
+            if std::mem::take(&mut self.drag_pending) {
+                log::info!("drag cancelled: capture released before drop");
+                let _ = self.event_tx.send(ICaptureEvent::DragCancelled(handle));
+            }
             // Synthesize key-up events for every key still held in the
             // capture's pressed_keys set BEFORE sending Leave. Without
             // this, pressing the release-bind chord (typically all four

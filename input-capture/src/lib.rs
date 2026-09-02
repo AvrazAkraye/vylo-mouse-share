@@ -21,6 +21,25 @@ mod libei;
 #[cfg(target_os = "macos")]
 mod macos;
 
+/// cross-machine drag-and-drop: detect a file drag in progress locally
+#[cfg(target_os = "macos")]
+mod macos_drag;
+
+/// Files currently being dragged on this machine (empty if none). Used
+/// at the moment the cursor crosses to a peer so the drag can be carried
+/// over. Only macOS can observe another app's drag today; elsewhere this
+/// is always empty.
+pub fn active_drag_files() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_drag::active_drag_files()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
 #[cfg(layer_shell)]
 mod layer_shell;
 

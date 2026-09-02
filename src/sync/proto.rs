@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const PROTO_VERSION: u16 = 1;
+/// bumped whenever `SyncMessage` gains variants; peers log a mismatch
+pub(crate) const PROTO_VERSION: u16 = 2;
 /// chunk size for file transfers
 pub(crate) const CHUNK_SIZE: usize = 256 * 1024;
 /// upper bound on a single frame; a chunk plus bincode/struct overhead
@@ -94,6 +95,31 @@ pub(crate) enum SyncMessage {
 
     Ping,
     Pong,
+
+    /* cross-machine drag & drop. Appended AFTER the existing variants so
+     * their bincode indices stay stable; a separate DragOffer (instead
+     * of a flag on FileOffer) keeps FileOffer wire-compatible. */
+    /// the pointer crossed to the receiver while dragging `count` files
+    DragBegin {
+        drag: u64,
+        count: u32,
+    },
+    /// like FileOffer but belongs to drag `drag` and is staged rather than
+    /// delivered; FileAccept/Reject/Chunk/Done/Cancel are reused by `id`
+    DragOffer {
+        drag: u64,
+        id: u64,
+        name: String,
+        size: u64,
+    },
+    /// the button was released on the receiver: commit the staged files
+    DragDrop {
+        drag: u64,
+    },
+    /// the pointer went back before release: discard the staged files
+    DragCancel {
+        drag: u64,
+    },
 }
 
 pub(crate) async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<SyncMessage, ProtoError> {

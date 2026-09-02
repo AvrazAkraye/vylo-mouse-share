@@ -253,6 +253,8 @@ pub enum FrontendEvent {
     },
     /// file transfer progress
     FileTransfer(FileTransferStatus),
+    /// files dragged across from the peer were dropped here (final paths)
+    FilesDropped { paths: Vec<String> },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

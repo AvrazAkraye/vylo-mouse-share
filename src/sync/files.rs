@@ -10,6 +10,7 @@ use super::proto::{CHUNK_SIZE, SyncMessage};
 use lan_mouse_ipc::{Direction, FileTransferStatus, TransferState};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -108,6 +109,96 @@ pub(crate) struct RecvTransfer {
     pub(crate) final_path: PathBuf,
     pub(crate) hasher: Sha256,
     pub(crate) last_progress: Instant,
+    /// the cross-machine drag this transfer belongs to, if any
+    pub(crate) drag: Option<u64>,
+}
+
+/// A cross-machine drag being received: its files are staged in a
+/// private directory and only moved to the drop location once the peer
+/// confirms the button was released (`DragDrop`). A `DragCancel`, a
+/// connection loss, or a superseding drag discards the staging area.
+pub(crate) struct IncomingDrag {
+    pub(crate) drag: u64,
+    /// `<file_dir>/.vylo-drag-<drag>/`
+    pub(crate) dir: PathBuf,
+    /// number of files the source announced
+    pub(crate) expected: u32,
+    /// offers seen so far (accepted or rejected)
+    pub(crate) offered: u32,
+    /// transfer ids offered but not yet finished (done or failed)
+    pub(crate) outstanding: HashSet<u64>,
+    /// staged files that completed successfully
+    pub(crate) done: Vec<PathBuf>,
+    /// the source reported the button release
+    pub(crate) drop_requested: bool,
+}
+
+impl IncomingDrag {
+    /// all announced files have been offered and every offer has settled
+    fn settled(&self) -> bool {
+        self.offered >= self.expected && self.outstanding.is_empty()
+    }
+}
+
+/// Where dropped files land: the Desktop is the natural "I dragged it to
+/// the other computer" destination; fall back to the regular receive dir.
+pub(crate) fn drop_dir(fallback: &Path) -> PathBuf {
+    dirs::desktop_dir().unwrap_or_else(|| fallback.to_path_buf())
+}
+
+/// If the drop was requested and every file has settled, move the staged
+/// files into place, remove the staging dir and report the final paths.
+pub(crate) async fn try_finalize_drag(
+    incoming: &mut Option<IncomingDrag>,
+    fallback_dir: &Path,
+    events: &super::EventSender,
+) {
+    let ready = incoming
+        .as_ref()
+        .is_some_and(|d| d.drop_requested && d.settled());
+    if !ready {
+        return;
+    }
+    let Some(d) = incoming.take() else { return };
+    let dest = drop_dir(fallback_dir);
+    if let Err(e) = tokio::fs::create_dir_all(&dest).await {
+        log::warn!("cannot create drop dir {}: {e}", dest.display());
+    }
+    let mut placed = Vec::new();
+    for staged in d.done {
+        let Some(name) = staged.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let target = unique_path(&dest, &name);
+        // rename first; the staging dir normally shares a volume with
+        // file_dir but the Desktop may not, so fall back to copy+remove
+        let moved = match tokio::fs::rename(&staged, &target).await {
+            Ok(()) => true,
+            Err(_) => match tokio::fs::copy(&staged, &target).await {
+                Ok(_) => {
+                    let _ = tokio::fs::remove_file(&staged).await;
+                    true
+                }
+                Err(e) => {
+                    log::warn!("cannot place dropped file {}: {e}", target.display());
+                    false
+                }
+            },
+        };
+        if moved {
+            placed.push(target);
+        }
+    }
+    let _ = tokio::fs::remove_dir_all(&d.dir).await;
+    if !placed.is_empty() {
+        log::info!("dropped {} file(s) into {}", placed.len(), dest.display());
+        events.send(super::SyncEvent::DragDropped { paths: placed });
+    }
+}
+
+/// throw away a staged drag (cancelled, superseded, or connection lost)
+pub(crate) async fn discard_drag(d: IncomingDrag) {
+    let _ = tokio::fs::remove_dir_all(&d.dir).await;
 }
 
 impl RecvTransfer {
@@ -130,6 +221,9 @@ pub(crate) async fn send_file(
     out_tx: Sender<SyncMessage>,
     accept_rx: oneshot::Receiver<Result<(), String>>,
     events: super::EventSender,
+    // when part of a cross-machine drag, the receiver stages it instead of
+    // delivering it
+    drag: Option<u64>,
 ) {
     let name = path
         .file_name()
@@ -161,15 +255,20 @@ pub(crate) async fn send_file(
     }
     let size = meta.len();
 
-    if out_tx
-        .send(SyncMessage::FileOffer {
+    let offer = match drag {
+        Some(drag) => SyncMessage::DragOffer {
+            drag,
             id,
             name: name.clone(),
             size,
-        })
-        .await
-        .is_err()
-    {
+        },
+        None => SyncMessage::FileOffer {
+            id,
+            name: name.clone(),
+            size,
+        },
+    };
+    if out_tx.send(offer).await.is_err() {
         return fail(&events, "connection closed".to_string());
     }
     events.send(super::SyncEvent::Transfer(status(
@@ -258,6 +357,7 @@ pub(crate) async fn begin_recv(
     dir: &Path,
     offered_name: &str,
     size: u64,
+    drag: Option<u64>,
 ) -> Result<RecvTransfer, String> {
     let name = sanitize_name(offered_name).ok_or_else(|| "invalid file name".to_string())?;
     tokio::fs::create_dir_all(dir)
@@ -283,6 +383,7 @@ pub(crate) async fn begin_recv(
         final_path,
         hasher: Sha256::new(),
         last_progress: Instant::now(),
+        drag,
     })
 }
 

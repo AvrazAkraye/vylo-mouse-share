@@ -500,6 +500,13 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
+        // Every left-button release — whether we are capturing or the
+        // pointer is local — ends any file drag, so let the drag detector
+        // consume the drag-pasteboard generation (see macos_drag.rs).
+        if matches!(event_type, CGEventType::LeftMouseUp) {
+            crate::macos_drag::on_left_mouse_up();
+        }
+
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
@@ -523,7 +530,16 @@ fn create_event_tap<'a>(
             ) {
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
             }
-        } else if matches!(event_type, CGEventType::MouseMoved) {
+        } else if matches!(
+            event_type,
+            // Dragged variants too: a file drag (button held) must be
+            // able to cross to the peer for drag-and-drop to work —
+            // MouseMoved alone would pin a dragged cursor at the edge.
+            CGEventType::MouseMoved
+                | CGEventType::LeftMouseDragged
+                | CGEventType::RightMouseDragged
+                | CGEventType::OtherMouseDragged
+        ) {
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 capture_position = Some(new_pos);

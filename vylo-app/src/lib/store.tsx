@@ -61,6 +61,8 @@ export interface DaemonStore {
   pairing: PairingUiState;
   transfers: FileTransfer[];
   lastClipboard: (ClipboardSynced & { at: number }) | null;
+  /** most recent cross-machine drag-and-drop that landed here */
+  lastDrop: { paths: string[]; at: number } | null;
   /** addrs of currently connected incoming devices (DTLS input link) */
   incoming: string[];
   port: number;
@@ -81,6 +83,7 @@ const initialState: DaemonStore = {
   pairing: { phase: "idle", pin: null, port: null, error: null, peerName: null },
   transfers: [],
   lastClipboard: null,
+  lastDrop: null,
   incoming: [],
   port: 4242,
   lastError: null,
@@ -197,6 +200,8 @@ function applyEvent(s: DaemonStore, e: DaemonEvent): DaemonStore {
       return { ...s, lastClipboard: { ...e.info, at: Date.now() } };
     case "FileTransfer":
       return { ...s, transfers: upsertTransfer(s.transfers, e.transfer) };
+    case "FilesDropped":
+      return { ...s, lastDrop: { paths: e.paths, at: Date.now() } };
     default:
       return s;
   }

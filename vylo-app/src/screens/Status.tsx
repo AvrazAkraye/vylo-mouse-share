@@ -265,10 +265,35 @@ export function StatusScreen({ onNavigate }: { onNavigate: (tab: TabId) => void 
         </div>
         <div className="text-xs text-muted">
           {s.sync.connected
-            ? `Sent straight to ${peerName ?? "your peer"}`
+            ? `Sent straight to ${peerName ?? "your peer"} — or just drag a file off the edge of the screen onto it`
             : "Peer is offline — transfers start when it reconnects"}
         </div>
       </button>
+
+      {/* Cross-machine drag-and-drop landed here */}
+      {s.lastDrop && s.lastDrop.paths.length > 0 && (
+        <Card>
+          <CardBody className="flex items-center justify-between gap-3 py-3">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-ink">
+                {s.lastDrop.paths.length === 1
+                  ? "1 file dropped here"
+                  : `${s.lastDrop.paths.length} files dropped here`}
+              </div>
+              <div className="truncate text-xs text-muted">
+                {s.lastDrop.paths.map((p) => p.split(/[\\/]/).pop()).join(", ")}
+              </div>
+            </div>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => backend.openFileDir(s.lastDrop!.paths[0]).catch(() => {})}
+            >
+              Show
+            </Button>
+          </CardBody>
+        </Card>
+      )}
 
       {/* Transfers */}
       <Card>
