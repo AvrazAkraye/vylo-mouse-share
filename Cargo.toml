@@ -12,7 +12,7 @@ members = [
 [package]
 name = "vylo-mouse-share"
 description = "Vylo Mouse Share — mouse, keyboard, clipboard and file sharing between two machines on a LAN"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/AvrazAkraye/vylo-mouse-share"

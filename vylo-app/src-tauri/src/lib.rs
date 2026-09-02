@@ -13,6 +13,10 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // in-app updates: signed manifest + artifacts from GitHub Releases
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // needed to relaunch after an update is installed
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // ============================================================
             // DAEMON EMBED POINT

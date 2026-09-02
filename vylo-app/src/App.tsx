@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Activity, Link2, LayoutGrid, Settings as SettingsIcon } from "lucide-react";
 import { requests } from "./lib/ipc";
-import { useDaemon } from "./lib/store";
+import { useAppVersion, useDaemon } from "./lib/store";
 import { cn } from "./lib/utils";
 import { DropOverlay } from "./components/DropOverlay";
 import { Dot } from "./components/ui/badge";
@@ -22,6 +22,7 @@ const NAV: Array<{ id: TabId; label: string; icon: typeof Activity }> = [
 export default function App() {
   const [tab, setTab] = useState<TabId>("status");
   const s = useDaemon();
+  const version = useAppVersion();
 
   return (
     <div className="flex h-full bg-bg text-ink">
@@ -74,6 +75,14 @@ export default function App() {
               </button>
             </div>
           )}
+          <button
+            type="button"
+            onClick={() => setTab("settings")}
+            title="About & updates"
+            className="mt-1.5 text-[11px] text-faint outline-none hover:text-muted focus-visible:text-muted"
+          >
+            v{version}
+          </button>
         </div>
       </aside>
 

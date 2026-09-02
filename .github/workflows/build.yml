@@ -35,17 +35,23 @@ jobs:
       matrix:
         include:
           - os: macos-14
-            bundles: dmg
+            # `app` is what the in-app updater ships (.app.tar.gz + .sig);
+            # `dmg` is the human-facing installer
+            bundles: app,dmg
             artifact: vylo-macos-arm64
             # vylo-app is a workspace member, so Tauri bundles land in
             # the workspace-root target/, not vylo-app/src-tauri/target/
             path: |
               target/release/bundle/dmg/*.dmg
+              target/release/bundle/macos/*.app.tar.gz
+              target/release/bundle/macos/*.app.tar.gz.sig
           - os: windows-latest
+            # the NSIS installer doubles as the updater artifact on Windows
             bundles: nsis
             artifact: vylo-windows-x64
             path: |
               target/release/bundle/nsis/*.exe
+              target/release/bundle/nsis/*.exe.sig
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,6 +64,11 @@ jobs:
         run: npm ci
       - name: Build app
         working-directory: vylo-app
+        env:
+          # minisign key for updater signatures; the app only installs
+          # updates whose .sig verifies against plugins.updater.pubkey
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: npx tauri build --bundles ${{ matrix.bundles }}
       - uses: actions/upload-artifact@v4
         with:
@@ -77,6 +88,56 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Normalize asset names
+        # GitHub rewrites spaces in asset names to dots, which would break
+        # the URLs in latest.json; use stable dash-separated names instead
+        # and stamp version/arch on the macOS updater bundle.
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -f "Vylo Mouse Share.app.tar.gz" ]; then
+            mv "Vylo Mouse Share.app.tar.gz"     "Vylo-Mouse-Share_${VERSION}_aarch64.app.tar.gz"
+            mv "Vylo Mouse Share.app.tar.gz.sig" "Vylo-Mouse-Share_${VERSION}_aarch64.app.tar.gz.sig"
+          fi
+          for f in *\ *; do [ -e "$f" ] && mv "$f" "${f// /-}"; done
+          ls -la
+      - name: Write updater manifest (latest.json)
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          python3 - "$VERSION" "$BASE" <<'PY'
+          import json, os, sys, datetime
+          version, base = sys.argv[1], sys.argv[2]
+          targets = {
+              "darwin-aarch64": f"Vylo-Mouse-Share_{version}_aarch64.app.tar.gz",
+              "windows-x86_64": f"Vylo-Mouse-Share_{version}_x64-setup.exe",
+          }
+          platforms = {}
+          for key, name in targets.items():
+              sig = name + ".sig"
+              if not (os.path.exists(name) and os.path.exists(sig)):
+                  print(f"::warning::missing updater artifact for {key}: {name}")
+                  continue
+              platforms[key] = {
+                  "signature": open(sig, encoding="utf-8").read().strip(),
+                  "url": f"{base}/{name}",
+              }
+          if not platforms:
+              sys.exit("no updater artifacts found — refusing to publish an empty manifest")
+          manifest = {
+              "version": version,
+              "notes": f"Vylo Mouse Share {version}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc)
+                  .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+              "platforms": platforms,
+          }
+          with open("latest.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+          print(json.dumps(manifest, indent=2))
+          PY
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**

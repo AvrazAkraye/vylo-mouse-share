@@ -7,6 +7,7 @@ import {
   type Dispatch,
   type ReactNode,
 } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
@@ -335,6 +336,27 @@ export function usePlatform(): string | null {
     };
   }, []);
   return platform;
+}
+
+let versionCache: string | null = null;
+
+/** Installed app version from the Tauri bundle ("1.0.3"), "…" until known. */
+export function useAppVersion(): string {
+  const [version, setVersion] = useState(versionCache ?? "…");
+  useEffect(() => {
+    if (versionCache !== null) return;
+    let disposed = false;
+    getVersion()
+      .then((v) => {
+        versionCache = v;
+        if (!disposed) setVersion(v);
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+    };
+  }, []);
+  return version;
 }
 
 /** The peer machine: first client by handle (two-machine design). */

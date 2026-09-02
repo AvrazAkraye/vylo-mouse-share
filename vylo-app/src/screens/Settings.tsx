@@ -6,6 +6,7 @@ import { Input } from "../components/ui/input";
 import { Switch } from "../components/ui/switch";
 import { Badge } from "../components/ui/badge";
 import { Dialog } from "../components/ui/dialog";
+import { UpdateCard } from "../components/UpdateCard";
 import { backend, requests } from "../lib/ipc";
 import { useDaemon } from "../lib/store";
 import { copyText, shortFingerprint } from "../lib/utils";
@@ -229,6 +230,8 @@ export function SettingsScreen() {
           )}
         </CardBody>
       </Card>
+
+      <UpdateCard />
 
       <Dialog
         open={removeFp !== null}

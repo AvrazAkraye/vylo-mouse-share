@@ -1,6 +1,6 @@
 [package]
 name = "vylo-app"
-version = "1.0.2"
+version = "1.0.3"
 description = "Vylo Mouse Share desktop app"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -17,6 +17,8 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 vylo-mouse-share = { path = "../..", default-features = false }
 lan-mouse-ipc = { path = "../../lan-mouse-ipc" }
