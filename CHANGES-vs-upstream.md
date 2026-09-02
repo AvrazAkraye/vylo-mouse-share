@@ -47,7 +47,15 @@ pairing, file transfer, clipboard toggle, discovery and Vylo settings.
 **Config** — new keys: `clipboard_sync`, `file_dir`, `sync_port`, `device_name`.
 
 **CI** (`.github/workflows/build.yml`) — tests on macOS + Windows, builds macOS `.dmg`
-and Windows NSIS installer, publishes a GitHub release on tag.
+and Windows NSIS installer, publishes a GitHub release on tag together with signed
+updater artifacts and the `latest.json` manifest.
+
+**In-app updates** (`vylo-app/src/components/UpdateCard.tsx`, `tauri-plugin-updater`)
+— Settings → About shows the installed version and a *Check for updates* button that
+downloads, installs and relaunches. Manifest and artifacts come from GitHub Releases;
+every artifact is minisign-signed in CI and verified against the public key embedded
+in `tauri.conf.json` before install. This is the only non-LAN connection the app
+makes, and only on user action (or when Settings is opened).
 
 ## Security fix to upstream
 

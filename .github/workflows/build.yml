@@ -96,6 +96,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          # upload-artifact keeps subdirectories when a matrix entry spans
+          # several bundle dirs (macos/, dmg/); flatten before renaming
+          find . -mindepth 2 -type f -exec mv -t . {} +
+          find . -mindepth 1 -type d -empty -delete
           if [ -f "Vylo Mouse Share.app.tar.gz" ]; then
             mv "Vylo Mouse Share.app.tar.gz"     "Vylo-Mouse-Share_${VERSION}_aarch64.app.tar.gz"
             mv "Vylo Mouse Share.app.tar.gz.sig" "Vylo-Mouse-Share_${VERSION}_aarch64.app.tar.gz.sig"
@@ -119,14 +123,13 @@ jobs:
           for key, name in targets.items():
               sig = name + ".sig"
               if not (os.path.exists(name) and os.path.exists(sig)):
-                  print(f"::warning::missing updater artifact for {key}: {name}")
-                  continue
+                  # a manifest missing a platform would strand that platform
+                  # on the old version forever; fail the release instead
+                  sys.exit(f"missing updater artifact for {key}: {name} (+ .sig)")
               platforms[key] = {
                   "signature": open(sig, encoding="utf-8").read().strip(),
                   "url": f"{base}/{name}",
               }
-          if not platforms:
-              sys.exit("no updater artifacts found — refusing to publish an empty manifest")
           manifest = {
               "version": version,
               "notes": f"Vylo Mouse Share {version}",

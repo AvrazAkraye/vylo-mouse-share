@@ -9,7 +9,8 @@ the edge of one screen and it appears on the other, Barrier/Synergy style — pl
 - **PIN pairing** — a 6-digit PIN pairs exactly your two machines (SPAKE2, no offline
   brute-force), after which both channels are mutually authenticated end-to-end
 - **LAN-only** — traffic is DTLS/TLS-encrypted peer-to-peer; no servers, no telemetry,
-  nothing leaves your network
+  nothing leaves your network. The single exception is the on-demand update check
+  (Settings → About), which fetches signed releases from this GitHub repo
 
 Supported: **macOS ↔ Windows** (the primary target), and the Linux backends inherited
 from upstream.

@@ -62,6 +62,23 @@ Vylo lives in the menu bar (macOS) / system tray (Windows): connection status,
 clipboard toggle, received-files folder, quit. Closing the window hides it — the app
 keeps running. Enable **Start on login** in Settings on both machines and forget it.
 
+## 7. Updating
+
+The installed version shows at the bottom of the sidebar and in **Settings → About**.
+Press **Check for updates** (Settings also checks quietly when opened); if a newer
+release exists the button becomes **Update to vX.Y.Z** — click it to download, install
+and relaunch. Updates are fetched from this project's GitHub Releases only and are
+installed solely when their signature verifies against the key built into the app.
+This is the one connection Vylo makes outside your LAN, and only when you open
+Settings or press the button.
+
+Update both machines: new features that touch the wire protocol need matching
+versions on both sides.
+
+On macOS, an update installed this way carries the release build's signature, so
+macOS may ask you to re-grant **Accessibility** / **Input Monitoring** afterwards.
+If it does, re-tick both in *System Settings → Privacy & Security* and press Retry.
+
 ## Known limitations
 
 - Both machines must use the same sync port (default 4243); change it in
