@@ -7,7 +7,7 @@ use std::{
 
 use slab::Slab;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, ModifierMap, Position};
 
 use crate::config::ConfigClient;
 
@@ -33,6 +33,8 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
+            speed: config_client.speed,
+            modifiers: config_client.modifiers,
         };
         let state = ClientState {
             active: config_client.active,
@@ -234,6 +236,28 @@ impl ClientManager {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             c.cmd = enter_hook;
         }
+    }
+
+    /// update the pointer speed multiplier for the client
+    pub(crate) fn set_speed(&self, handle: ClientHandle, speed: f64) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.speed = speed;
+        }
+    }
+
+    /// update the modifier mapping for the client
+    pub(crate) fn set_modifiers(&self, handle: ClientHandle, modifiers: ModifierMap) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.modifiers = modifiers;
+        }
+    }
+
+    /// pointer speed + modifier mapping applied to input sent to the client
+    pub(crate) fn get_tuning(&self, handle: ClientHandle) -> Option<(f64, ModifierMap)> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| (c.speed, c.modifiers))
     }
 
     /// set resolving status of the client

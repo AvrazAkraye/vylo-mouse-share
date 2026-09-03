@@ -44,7 +44,14 @@ socket. Replaces the GTK frontend.
 **IPC additions** (`lan-mouse-ipc`) — new `FrontendRequest`/`FrontendEvent` variants for
 pairing, file transfer, clipboard toggle, discovery and Vylo settings.
 
-**Config** — new keys: `clipboard_sync`, `file_dir`, `sync_port`, `device_name`.
+**Config** — new keys: `clipboard_sync`, `file_dir`, `sync_port`, `device_name`; per
+client: `speed` and `[clients.modifiers]`.
+
+**Per-device input tuning** (`src/tuning.rs`, applied in `src/capture.rs` at send time)
+— pointer speed multiplier (with sub-pixel carry so slow speeds don't drop motion) and
+a modifier remap (what local Ctrl / Alt / Meta act as on the peer, applied to key codes
+and to the XKB bitmask; synthesized key-ups on release are remapped identically).
+Configured per client from Settings → *Input on <device>*.
 
 **CI** (`.github/workflows/build.yml`) — tests on macOS + Windows, builds macOS `.dmg`
 and Windows NSIS installer, publishes a GitHub release on tag together with signed

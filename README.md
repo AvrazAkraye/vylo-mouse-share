@@ -3,6 +3,8 @@
 Share one mouse and keyboard between two machines on the same LAN — move the cursor off
 the edge of one screen and it appears on the other, Barrier/Synergy style — plus:
 
+- **Per-device input tuning** — mouse speed and what your Ctrl / Alt / Cmd-Win keys act
+  as on the other machine (e.g. ⌘ as Ctrl on Windows), set from either side
 - **Clipboard sync** — text and images, both directions, with echo prevention
 - **File transfer** — drag files onto the Vylo window (or use *Send files…*); they arrive
   sha256-verified in `~/Downloads/VyloShare` on the other machine

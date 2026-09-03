@@ -20,12 +20,33 @@ import { invoke } from "@tauri-apps/api/core";
 export type Position = "left" | "right" | "top" | "bottom";
 export type Status = "Enabled" | "Disabled";
 
+/** a modifier role: ctrl everywhere; alt = Alt/Option; meta = Win/Super/Command */
+export type Modifier = "ctrl" | "alt" | "meta";
+
+/** what each local modifier key acts as on a client (identity by default) */
+export interface ModifierMap {
+  ctrl: Modifier;
+  alt: Modifier;
+  meta: Modifier;
+}
+
+export const IDENTITY_MODIFIERS: ModifierMap = { ctrl: "ctrl", alt: "alt", meta: "meta" };
+
+/** pointer-speed bounds, mirrored from lan-mouse-ipc */
+export const MIN_SPEED = 0.25;
+export const MAX_SPEED = 4;
+export const DEFAULT_SPEED = 1;
+
 export interface ClientConfig {
   hostname: string | null;
   fix_ips: string[];
   port: number;
   pos: Position;
   cmd: string | null;
+  /** pointer speed multiplier for motion sent to this client */
+  speed: number;
+  /** what the local modifier keys act as on this client */
+  modifiers: ModifierMap;
 }
 
 export interface ClientState {
@@ -232,6 +253,9 @@ export const requests = {
   setKeyboardLayoutSync: (enabled: boolean) => send({ SetKeyboardLayoutSync: enabled }),
   setFileDir: (dir: string) => send({ SetFileDir: dir }),
   setDeviceName: (name: string) => send({ SetDeviceName: name }),
+  updateSpeed: (handle: ClientHandle, speed: number) => send({ UpdateSpeed: [handle, speed] }),
+  updateModifierMap: (handle: ClientHandle, map: ModifierMap) =>
+    send({ UpdateModifierMap: [handle, map] }),
 };
 
 /* ------------------------------------------------------------------ */

@@ -130,7 +130,102 @@ impl TryFrom<&str> for Position {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+/// A modifier key role. Used to describe what a local modifier key acts
+/// as on a given client (see [`ModifierMap`]).
+#[derive(Debug, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Modifier {
+    /// Control on every platform
+    Ctrl,
+    /// Alt (Windows/Linux) / Option (macOS)
+    Alt,
+    /// Windows key (Windows) / Super (Linux) / Command (macOS)
+    Meta,
+}
+
+impl Display for Modifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Modifier::Ctrl => "ctrl",
+            Modifier::Alt => "alt",
+            Modifier::Meta => "meta",
+        })
+    }
+}
+
+impl TryFrom<&str> for Modifier {
+    type Error = ();
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "ctrl" => Ok(Modifier::Ctrl),
+            "alt" => Ok(Modifier::Alt),
+            "meta" => Ok(Modifier::Meta),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Which modifier each local modifier key acts as when input is sent to
+/// a client. The default is the identity (keys act as themselves). This
+/// lets e.g. a Mac keyboard's Command key act as Ctrl on a Windows
+/// machine, or undo a macOS-level Ctrl/Command swap for the peer.
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+pub struct ModifierMap {
+    /// what the local Ctrl key(s) act as
+    #[serde(default = "ModifierMap::default_ctrl")]
+    pub ctrl: Modifier,
+    /// what the local Alt / Option key(s) act as
+    #[serde(default = "ModifierMap::default_alt")]
+    pub alt: Modifier,
+    /// what the local Windows / Super / Command key(s) act as
+    #[serde(default = "ModifierMap::default_meta")]
+    pub meta: Modifier,
+}
+
+impl ModifierMap {
+    const fn default_ctrl() -> Modifier {
+        Modifier::Ctrl
+    }
+    const fn default_alt() -> Modifier {
+        Modifier::Alt
+    }
+    const fn default_meta() -> Modifier {
+        Modifier::Meta
+    }
+
+    /// true if every key acts as itself
+    pub fn is_identity(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for ModifierMap {
+    fn default() -> Self {
+        Self {
+            ctrl: Modifier::Ctrl,
+            alt: Modifier::Alt,
+            meta: Modifier::Meta,
+        }
+    }
+}
+
+/// pointer speed multiplier applied to motion sent to a client (1.0 = unchanged)
+pub const DEFAULT_SPEED: f64 = 1.0;
+/// bounds for [`ClientConfig::speed`]
+pub const MIN_SPEED: f64 = 0.25;
+pub const MAX_SPEED: f64 = 4.0;
+
+/// clamp a requested speed into the supported range; NaN → default
+pub fn clamp_speed(speed: f64) -> f64 {
+    if speed.is_nan() {
+        DEFAULT_SPEED
+    } else {
+        speed.clamp(MIN_SPEED, MAX_SPEED)
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// hostname of this client
     pub hostname: Option<String>,
@@ -142,6 +237,16 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// pointer speed multiplier for motion sent to this client
+    #[serde(default = "default_speed")]
+    pub speed: f64,
+    /// what the local modifier keys act as on this client
+    #[serde(default)]
+    pub modifiers: ModifierMap,
+}
+
+fn default_speed() -> f64 {
+    DEFAULT_SPEED
 }
 
 impl Default for ClientConfig {
@@ -152,6 +257,8 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            speed: DEFAULT_SPEED,
+            modifiers: ModifierMap::default(),
         }
     }
 }
@@ -298,7 +405,7 @@ pub struct FileTransferStatus {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
     /// activate/deactivate client
     Activate(ClientHandle, bool),
@@ -351,6 +458,10 @@ pub enum FrontendRequest {
     SetFileDir(String),
     /// set this device's name
     SetDeviceName(String),
+    /// pointer speed multiplier for motion sent to a client
+    UpdateSpeed(ClientHandle, f64),
+    /// what the local modifier keys act as on a client
+    UpdateModifierMap(ClientHandle, ModifierMap),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

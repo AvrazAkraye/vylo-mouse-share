@@ -8,11 +8,12 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
     sync::{SyncEvent, SyncOptions, SyncRequest, VyloSync},
+    tuning::ClientTuning,
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    IpcListenerCreationError, ModifierMap, Position, Status,
 };
 use log;
 use std::{
@@ -253,6 +254,14 @@ impl Service {
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
                 self.update_enter_hook(handle, enter_hook)
             }
+            FrontendRequest::UpdateSpeed(handle, speed) => {
+                self.update_speed(handle, speed);
+                self.save_config();
+            }
+            FrontendRequest::UpdateModifierMap(handle, modifiers) => {
+                self.update_modifiers(handle, modifiers);
+                self.save_config();
+            }
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::StartPairing => self.sync.request(SyncRequest::StartPairing),
             FrontendRequest::PairWithPeer { addr, pin } => {
@@ -372,6 +381,8 @@ impl Service {
             pos,
             active: false,
             enter_hook: None,
+            speed: lan_mouse_ipc::DEFAULT_SPEED,
+            modifiers: Default::default(),
         });
         if let Some((c, s)) = self.client_manager.get_state(handle) {
             self.notify_frontend(FrontendEvent::Created(handle, c, s));
@@ -400,6 +411,8 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                speed: c.speed,
+                modifiers: c.modifiers,
             })
             .collect();
         self.config.set_clients(clients);
@@ -728,6 +741,7 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
+            self.push_tuning(handle);
             self.capture.create(handle, pos, CaptureType::Default);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
@@ -784,6 +798,27 @@ impl Service {
     fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {
         self.client_manager.set_enter_hook(handle, enter_hook);
         self.broadcast_client(handle);
+    }
+
+    fn update_speed(&mut self, handle: ClientHandle, speed: f64) {
+        self.client_manager
+            .set_speed(handle, lan_mouse_ipc::clamp_speed(speed));
+        self.push_tuning(handle);
+        self.broadcast_client(handle);
+    }
+
+    fn update_modifiers(&mut self, handle: ClientHandle, modifiers: ModifierMap) {
+        self.client_manager.set_modifiers(handle, modifiers);
+        self.push_tuning(handle);
+        self.broadcast_client(handle);
+    }
+
+    /// hand the client's current speed / modifier mapping to the capture
+    fn push_tuning(&self, handle: ClientHandle) {
+        if let Some((speed, modifiers)) = self.client_manager.get_tuning(handle) {
+            self.capture
+                .set_tuning(handle, ClientTuning::new(speed, modifiers));
+        }
     }
 
     fn broadcast_client(&mut self, handle: ClientHandle) {

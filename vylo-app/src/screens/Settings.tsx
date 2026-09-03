@@ -6,6 +6,7 @@ import { Input } from "../components/ui/input";
 import { Switch } from "../components/ui/switch";
 import { Badge } from "../components/ui/badge";
 import { Dialog } from "../components/ui/dialog";
+import { PeerInputCard } from "../components/PeerInputCard";
 import { UpdateCard } from "../components/UpdateCard";
 import { backend, requests } from "../lib/ipc";
 import { useDaemon } from "../lib/store";
@@ -167,6 +168,8 @@ export function SettingsScreen() {
           </Row>
         </CardBody>
       </Card>
+
+      <PeerInputCard />
 
       <Card>
         <CardHeader

@@ -17,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{DEFAULT_PORT, DEFAULT_SPEED, ModifierMap, Position, clamp_speed};
 
 use input_event::scancode::{
     self,
@@ -76,7 +76,7 @@ struct ConfigToml {
     device_name: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 struct TomlClient {
     hostname: Option<String>,
     host_name: Option<String>,
@@ -85,6 +85,10 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
+    /// pointer speed multiplier for motion sent to this client (1.0 = unchanged)
+    speed: Option<f64>,
+    /// what the local modifier keys act as on this client
+    modifiers: Option<ModifierMap>,
 }
 
 impl ConfigToml {
@@ -280,6 +284,8 @@ pub struct ConfigClient {
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
+    pub speed: f64,
+    pub modifiers: ModifierMap,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -290,6 +296,8 @@ impl From<TomlClient> for ConfigClient {
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
+        let speed = clamp_speed(toml.speed.unwrap_or(DEFAULT_SPEED));
+        let modifiers = toml.modifiers.unwrap_or_default();
         Self {
             ips,
             hostname,
@@ -297,6 +305,8 @@ impl From<TomlClient> for ConfigClient {
             pos,
             active,
             enter_hook,
+            speed,
+            modifiers,
         }
     }
 }
@@ -316,6 +326,9 @@ impl From<ConfigClient> for TomlClient {
         let position = Some(client.pos);
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
+        // only persist what differs from the defaults
+        let speed = (client.speed != DEFAULT_SPEED).then_some(client.speed);
+        let modifiers = (!client.modifiers.is_identity()).then_some(client.modifiers);
         Self {
             hostname,
             host_name,
@@ -324,6 +337,8 @@ impl From<ConfigClient> for TomlClient {
             position,
             activate_on_startup,
             enter_hook,
+            speed,
+            modifiers,
         }
     }
 }
@@ -667,5 +682,73 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lan_mouse_ipc::Modifier;
+
+    #[test]
+    fn client_tuning_roundtrips_through_toml_and_omits_defaults() {
+        let tuned = ConfigClient {
+            ips: HashSet::from(["192.168.100.87".parse().unwrap()]),
+            hostname: Some("pc".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Right,
+            active: true,
+            enter_hook: None,
+            speed: 1.5,
+            modifiers: ModifierMap {
+                ctrl: Modifier::Meta,
+                alt: Modifier::Alt,
+                meta: Modifier::Ctrl,
+            },
+        };
+        let plain = ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("laptop".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Left,
+            active: false,
+            enter_hook: None,
+            speed: DEFAULT_SPEED,
+            modifiers: ModifierMap::default(),
+        };
+        let config = ConfigToml {
+            clients: Some(vec![tuned.into(), plain.into()]),
+            ..Default::default()
+        };
+        let text = toml::to_string(&config).expect("serialize");
+        // nested modifier table sits under the client entry
+        assert!(text.contains("speed = 1.5"), "{text}");
+        assert!(text.contains("[clients.modifiers]"), "{text}");
+        assert!(text.contains("ctrl = \"meta\""), "{text}");
+        // untouched client carries neither key
+        assert_eq!(text.matches("speed").count(), 1, "{text}");
+        assert_eq!(text.matches("modifiers").count(), 1, "{text}");
+
+        let parsed: ConfigToml = toml::from_str(&text).expect("parse");
+        assert_eq!(parsed, config);
+        let clients: Vec<ConfigClient> = parsed
+            .clients
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(clients[0].speed, 1.5);
+        assert_eq!(clients[0].modifiers.ctrl, Modifier::Meta);
+        assert_eq!(clients[0].modifiers.meta, Modifier::Ctrl);
+        assert_eq!(clients[1].speed, DEFAULT_SPEED);
+        assert!(clients[1].modifiers.is_identity());
+    }
+
+    #[test]
+    fn out_of_range_speed_in_config_is_clamped() {
+        let c: TomlClient = toml::from_str("speed = 50.0").unwrap();
+        assert_eq!(ConfigClient::from(c).speed, lan_mouse_ipc::MAX_SPEED);
+        let c: TomlClient = toml::from_str("speed = 0.01").unwrap();
+        assert_eq!(ConfigClient::from(c).speed, lan_mouse_ipc::MIN_SPEED);
     }
 }

@@ -44,6 +44,25 @@ Move the cursor off that screen edge and it crosses over; move it back the oppos
 edge to return. Stuck? Press **Ctrl+Shift+Alt/Option+Meta/Cmd** (the release bind) to
 yank the cursor back.
 
+## 3b. Keys and mouse speed on the other machine
+
+**Settings → Input on <device>** tunes how *this* keyboard and mouse behave over there:
+
+- **Mouse speed** — a multiplier (0.25× to 4×) for cursor movement while it's on the
+  other machine. Each machine sets its own; the setting travels with the mouse, so on
+  the Mac you set the speed for the Windows screen and on the PC the speed for the Mac.
+- **Modifier keys** — what each of your Control / Option / Command (or Ctrl / Alt /
+  Windows) keys acts as on the other side. Typical uses:
+  - A Mac keyboard on a Windows PC: set **Command → Ctrl** so ⌘C / ⌘V copy and paste.
+  - You swapped Control and Command in *macOS System Settings → Keyboard → Modifier
+    Keys* (so Ctrl+C copies on the Mac): macOS applies that swap before Vylo sees the
+    key, which is why your Ctrl showed up as the Windows key. Press **Swap ⌃ and ⌘**
+    to undo it for the peer.
+  - Two keys may act as the same thing (e.g. both Control and Command → Ctrl).
+
+Changes apply immediately, only affect keys sent *from* this machine, and are stored
+per device in `config.toml` (`speed` and `[clients.modifiers]`).
+
 ## 4. Clipboard
 
 On by default — copy text or an image on one machine, paste on the other. Toggle it

@@ -10,6 +10,7 @@ pub mod emulation_test;
 mod listen;
 pub mod service;
 mod sync;
+mod tuning;
 
 /// Signal that this process runs a serviced main dispatch queue (a GUI
 /// host such as the Tauri app). Required before macOS keyboard-layout

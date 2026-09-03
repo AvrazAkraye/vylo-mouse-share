@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -14,7 +15,10 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::{
+    connect::LanMouseConnection,
+    tuning::{ClientTuning, TuningState, tune_event},
+};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -69,6 +73,8 @@ enum CaptureRequest {
     SetReleaseBind(Vec<scancode::Linux>),
     /// a file drag crossed to the active client; watch for its release
     SetDragPending(bool),
+    /// pointer speed + modifier mapping for input sent to a client
+    SetTuning(CaptureHandle, ClientTuning),
 }
 
 impl Capture {
@@ -83,6 +89,8 @@ impl Capture {
         let capture_task = CaptureTask {
             active_client: None,
             drag_pending: false,
+            tuning: HashMap::new(),
+            tuning_state: HashMap::new(),
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -154,6 +162,14 @@ impl Capture {
             .request_tx
             .send(CaptureRequest::SetDragPending(pending));
     }
+
+    /// set the pointer speed + modifier mapping applied to input sent to
+    /// `handle`; takes effect immediately, mid-session included
+    pub(crate) fn set_tuning(&self, handle: CaptureHandle, tuning: ClientTuning) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SetTuning(handle, tuning));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -178,6 +194,10 @@ struct CaptureTask {
     /// a file drag crossed to `active_client` and has not yet been
     /// dropped or cancelled
     drag_pending: bool,
+    /// per-client speed / modifier mapping (identity when absent)
+    tuning: HashMap<CaptureHandle, ClientTuning>,
+    /// per-client carry state: sub-pixel motion and held modifier keys
+    tuning_state: HashMap<CaptureHandle, TuningState>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -195,6 +215,22 @@ impl CaptureTask {
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
+        self.tuning.remove(&handle);
+        self.tuning_state.remove(&handle);
+    }
+
+    fn set_tuning(&mut self, handle: CaptureHandle, tuning: ClientTuning) {
+        self.tuning.insert(handle, tuning);
+        // Held modifiers deliberately survive a map change: their key-ups
+        // must release the codes the peer actually saw go down.
+    }
+
+    /// apply the client's speed / modifier mapping to an outgoing event;
+    /// `None` = swallow it (duplicate press of a collapsed modifier)
+    fn tune(&mut self, handle: CaptureHandle, event: Event) -> Option<Event> {
+        let tuning = self.tuning.get(&handle).copied().unwrap_or_default();
+        let state = self.tuning_state.entry(handle).or_default();
+        tune_event(&tuning, state, event)
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
@@ -235,6 +271,7 @@ impl CaptureTask {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
                         CaptureRequest::SetDragPending(p) => self.drag_pending = p,
+                        CaptureRequest::SetTuning(h, t) => self.set_tuning(h, t),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -329,6 +366,7 @@ impl CaptureTask {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
                     CaptureRequest::SetDragPending(p) => self.drag_pending = p,
+                    CaptureRequest::SetTuning(h, t) => self.set_tuning(h, t),
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -371,6 +409,9 @@ impl CaptureTask {
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
+            if let Some(st) = self.tuning_state.get_mut(&handle) {
+                st.reset();
+            }
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
@@ -395,6 +436,14 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
+        // Input that was already queued behind a release (the release-bind
+        // chord's own trailing events, motion after the peer's Leave) has
+        // nobody to go to; forwarding it after Leave would re-assert
+        // modifiers on the peer that release_capture just cleared.
+        if self.active_client.is_none() && matches!(event, CaptureEvent::Input(_)) {
+            return Ok(());
+        }
+
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
@@ -402,7 +451,10 @@ impl CaptureTask {
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e),
+                State::Sending => match self.tune(handle, e) {
+                    Some(e) => ProtoEvent::Input(e),
+                    None => return Ok(()),
+                },
             },
         };
 
@@ -413,6 +465,9 @@ impl CaptureTask {
             // stale pending drag that could fire a spurious drop later
             if std::mem::take(&mut self.drag_pending) {
                 let _ = self.event_tx.send(ICaptureEvent::DragCancelled(handle));
+            }
+            if let Some(st) = self.tuning_state.get_mut(&handle) {
+                st.reset();
             }
             capture.release().await?;
         }
@@ -438,10 +493,27 @@ impl CaptureTask {
             // then runs every subsequent keystroke through those held
             // mods until its watchdog times out (1+ s) or our Leave
             // arrives — and Leave can be lost over UDP/DTLS.
-            for key in capture.take_pressed_keys() {
+            // (released as the codes the peer actually saw go down — a
+            // remapped modifier must come up under the same code)
+            let modifiers = self
+                .tuning
+                .get(&handle)
+                .map(|t| t.modifiers)
+                .unwrap_or_default();
+            let mut tuning_state = self.tuning_state.remove(&handle).unwrap_or_default();
+            let mut key_ups: Vec<u32> = capture
+                .take_pressed_keys()
+                .into_iter()
+                .map(|key| tuning_state.release_code(&modifiers, key as u32))
+                .collect();
+            // plus anything recorded as down that the capture didn't list
+            key_ups.extend(tuning_state.drain_held());
+            key_ups.sort_unstable();
+            key_ups.dedup();
+            for key in key_ups {
                 let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
-                    key: key as u32,
+                    key,
                     state: 0,
                 }));
                 if let Err(e) = self.conn.send(key_up, handle).await {

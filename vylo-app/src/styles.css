@@ -115,3 +115,41 @@ textarea {
 .animate-vylo-spin {
   animation: vylo-spin 0.8s linear infinite;
 }
+
+/* Range slider (see components/ui/slider.tsx) */
+.vylo-slider {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 4px;
+  border-radius: 9999px;
+  outline: none;
+  cursor: pointer;
+}
+.vylo-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  height: 16px;
+  width: 16px;
+  border-radius: 9999px;
+  background: var(--surface);
+  border: 1.5px solid var(--accent);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.15);
+  cursor: grab;
+}
+.vylo-slider:active::-webkit-slider-thumb {
+  cursor: grabbing;
+}
+.vylo-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.vylo-slider:disabled {
+  cursor: default;
+}
+
+/* Native select styled like Input (see components/ui/select.tsx) */
+.vylo-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.6rem center;
+}
