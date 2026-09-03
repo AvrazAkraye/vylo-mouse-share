@@ -6,8 +6,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// bumped whenever `SyncMessage` gains variants; peers log a mismatch
-pub(crate) const PROTO_VERSION: u16 = 2;
+/// Bumped whenever `SyncMessage` gains variants. Peers still talk across
+/// a mismatch (older variants are wire-stable), but features that need
+/// the newer variants are gated on the peer's advertised version.
+pub(crate) const PROTO_VERSION: u16 = 3;
+/// first protocol version that understands folder (`Tree*`) transfers
+pub(crate) const PROTO_TREES: u16 = 3;
 /// chunk size for file transfers
 pub(crate) const CHUNK_SIZE: usize = 256 * 1024;
 /// upper bound on a single frame; a chunk plus bincode/struct overhead
@@ -119,6 +123,44 @@ pub(crate) enum SyncMessage {
     /// the pointer went back before release: discard the staged files
     DragCancel {
         drag: u64,
+    },
+
+    /* folder transfer (protocol v3+). A folder is one transfer to the
+     * user but many files on the wire: `TreeOffer` announces it, then
+     * `TreeDir` recreates every directory (so empty ones survive) and each
+     * file is offered with `TreeFile` — a FileOffer carrying its path
+     * relative to the folder — and streamed with the usual FileAccept /
+     * Chunk / Done / Cancel by `id`. `TreeEnd` closes the folder; the
+     * receiver keeps everything in a staging directory until then and
+     * only renames the finished tree into place if nothing failed. */
+    TreeOffer {
+        tree: u64,
+        /// the folder's own name
+        name: String,
+        /// number of files that will be offered
+        files: u32,
+        /// total bytes across those files
+        bytes: u64,
+        /// staged as part of this cross-machine drag, if any
+        drag: Option<u64>,
+    },
+    /// a directory inside the folder, `rel` = forward-slash relative path
+    TreeDir {
+        tree: u64,
+        rel: String,
+    },
+    /// a file inside the folder at `rel`; behaves like FileOffer afterwards
+    TreeFile {
+        tree: u64,
+        id: u64,
+        rel: String,
+        size: u64,
+    },
+    /// nothing more will be offered for this folder; `error` set when the
+    /// sender gave up (the receiver then discards what it staged)
+    TreeEnd {
+        tree: u64,
+        error: Option<String>,
     },
 }
 

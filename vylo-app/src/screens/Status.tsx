@@ -4,7 +4,9 @@ import {
   ArrowUpRight,
   ClipboardCopy,
   FilePlus2,
+  Folder,
   FolderOpen,
+  FolderPlus,
   Monitor,
   MousePointer2,
   RefreshCw,
@@ -42,7 +44,9 @@ function StatePill({
 
 function TransferRow({ t }: { t: FileTransfer }) {
   const received = t.direction === "received";
-  const Icon = received ? ArrowDownLeft : ArrowUpRight;
+  const folder = t.kind === "folder";
+  const Icon = folder ? Folder : received ? ArrowDownLeft : ArrowUpRight;
+  const fileCount = folder ? `${t.files} ${t.files === 1 ? "file" : "files"}` : null;
   return (
     <div className="flex items-center gap-3 py-2.5">
       <div
@@ -55,7 +59,10 @@ function TransferRow({ t }: { t: FileTransfer }) {
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline justify-between gap-2">
-          <span className="truncate text-[13px] font-medium text-ink">{t.name}</span>
+          <span className="truncate text-[13px] font-medium text-ink">
+            {t.name}
+            {fileCount && <span className="ml-1.5 font-normal text-faint">{fileCount}</span>}
+          </span>
           <span className="shrink-0 text-xs text-faint">
             {t.state === "active"
               ? `${formatBytes(t.transferred)} / ${formatBytes(t.total)}`
@@ -158,6 +165,19 @@ export function StatusScreen({ onNavigate }: { onNavigate: (tab: TabId) => void 
     }
   };
 
+  const sendFolder = async () => {
+    if (picking) return;
+    setPicking(true);
+    try {
+      const dir = await backend.pickDir("Send folder");
+      if (dir) await requests.sendFiles([dir]);
+    } catch {
+      /* dialog cancelled or bridge offline */
+    } finally {
+      setPicking(false);
+    }
+  };
+
   const inputDisabled = s.ipcConnected && (!s.captureEnabled || !s.emulationEnabled);
 
   return (
@@ -248,27 +268,31 @@ export function StatusScreen({ onNavigate }: { onNavigate: (tab: TabId) => void 
       </Card>
 
       {/* Drop zone */}
-      <button
-        type="button"
-        onClick={sendFiles}
-        disabled={picking}
+      <div
         className={cn(
-          "group flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-line",
-          "bg-surface px-6 py-7 text-center transition-colors",
-          "hover:border-accent hover:bg-accent-soft/40",
-          "outline-none focus-visible:ring-2 focus-visible:ring-accent/50",
+          "flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-line",
+          "bg-surface px-6 py-6 text-center transition-colors",
+          s.dragHover && "border-accent bg-accent-soft/40",
         )}
       >
-        <FilePlus2 size={20} className="text-faint transition-colors group-hover:text-accent" />
-        <div className="text-sm font-medium text-ink">
-          Drop files here or click to send
-        </div>
+        <FilePlus2 size={20} className={cn("text-faint", s.dragHover && "text-accent")} />
+        <div className="text-sm font-medium text-ink">Drop files or folders here</div>
         <div className="text-xs text-muted">
           {s.sync.connected
-            ? `Sent straight to ${peerName ?? "your peer"} — or just drag a file off the edge of the screen onto it`
+            ? `Sent straight to ${peerName ?? "your peer"} — or just drag them off the edge of the screen onto it`
             : "Peer is offline — transfers start when it reconnects"}
         </div>
-      </button>
+        <div className="mt-1.5 flex items-center gap-2">
+          <Button size="sm" variant="secondary" onClick={sendFiles} disabled={picking}>
+            <FilePlus2 size={14} />
+            Choose files…
+          </Button>
+          <Button size="sm" variant="secondary" onClick={sendFolder} disabled={picking}>
+            <FolderPlus size={14} />
+            Choose folder…
+          </Button>
+        </div>
+      </div>
 
       {/* Cross-machine drag-and-drop landed here */}
       {s.lastDrop && s.lastDrop.paths.length > 0 && (
@@ -277,8 +301,8 @@ export function StatusScreen({ onNavigate }: { onNavigate: (tab: TabId) => void 
             <div className="min-w-0">
               <div className="text-sm font-medium text-ink">
                 {s.lastDrop.paths.length === 1
-                  ? "1 file dropped here"
-                  : `${s.lastDrop.paths.length} files dropped here`}
+                  ? "1 item dropped here"
+                  : `${s.lastDrop.paths.length} items dropped here`}
               </div>
               <div className="truncate text-xs text-muted">
                 {s.lastDrop.paths.map((p) => p.split(/[\\/]/).pop()).join(", ")}
@@ -316,7 +340,7 @@ export function StatusScreen({ onNavigate }: { onNavigate: (tab: TabId) => void 
           {s.transfers.length === 0 ? (
             <div className="flex items-center gap-2.5 py-3 text-[13px] text-muted">
               <RefreshCw size={14} className="text-faint" />
-              Nothing transferred yet — drop a file above to get started.
+              Nothing transferred yet — drop a file or folder above to get started.
             </div>
           ) : (
             <div className="divide-y divide-line">

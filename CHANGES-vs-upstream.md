@@ -28,9 +28,13 @@ the machine's existing self-signed certificate identity, mutually authenticated 
 pinned to the same `authorized_fingerprints` allowlist.
 - `sync/clipboard.rs` — single-owner clipboard thread, text + images (PNG), ring-buffer
   echo suppression that survives OS re-encoding, decompression-bomb guard.
-- `sync/files.rs` + `sync/mod.rs` — chunked transfer, sha256 verify, `.vylopart` →
+- `sync/files.rs` + `sync/inbox.rs` — chunked transfer, sha256 verify, `.vylopart` →
   rename on success, filename sanitization (traversal + Windows reserved names), size &
-  per-chunk bounds, into `~/Downloads/VyloShare`.
+  per-chunk bounds, into `~/Downloads/VyloShare`. Folders (protocol v3, `Tree*`
+  messages) are walked on the sender (symlinks skipped), streamed file by file through a
+  small window into a staging directory, and renamed into place only once every file
+  verified; relative paths are validated per component. The sender aborts a stream the
+  moment the peer cancels it.
 - `sync/pairing.rs` — 6-digit PIN → SPAKE2 (no offline brute-force) bound to the TLS
   session via exported keying material (defeats a relay MITM), then fingerprint exchange
   into the allowlist and automatic client setup.

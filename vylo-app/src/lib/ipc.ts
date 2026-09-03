@@ -83,6 +83,7 @@ export interface VyloState {
 
 export type TransferDirection = "sent" | "received";
 export type TransferState = "active" | "done" | "failed";
+export type TransferKind = "file" | "folder";
 
 export interface FileTransfer {
   id: number;
@@ -92,6 +93,10 @@ export interface FileTransfer {
   total: number;
   state: TransferState;
   detail: string | null;
+  /** a single file, or a whole folder reported as one row */
+  kind: TransferKind;
+  /** files inside a folder transfer (0 for a file) */
+  files: number;
 }
 
 export interface ClipboardSynced {
@@ -207,7 +212,10 @@ export function parseDaemonEvent(raw: string): DaemonEvent | null {
       case "ClipboardSynced":
         return { type: "ClipboardSynced", info: p };
       case "FileTransfer":
-        return { type: "FileTransfer", transfer: p };
+        return {
+          type: "FileTransfer",
+          transfer: { kind: "file", files: 0, ...p },
+        };
       case "FilesDropped":
         return { type: "FilesDropped", paths: p.paths ?? [] };
       default:
@@ -264,7 +272,7 @@ export const requests = {
 
 export const backend = {
   pickFiles: () => invoke<string[] | null>("pick_files"),
-  pickDir: () => invoke<string | null>("pick_dir"),
+  pickDir: (title?: string) => invoke<string | null>("pick_dir", { title: title ?? null }),
   openFileDir: (path: string) => invoke<void>("open_file_dir", { path }),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
   getAutostart: () => invoke<boolean>("get_autostart"),

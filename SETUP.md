@@ -68,12 +68,20 @@ per device in `config.toml` (`speed` and `[clients.modifiers]`).
 On by default — copy text or an image on one machine, paste on the other. Toggle it
 from the tray/menu-bar icon or the Status screen.
 
-## 5. Send files
+## 5. Send files and folders
 
-Either drag files onto the Vylo window (drop overlay appears), or click **Send files…**
-on the Status screen. Files land on the other machine in `~/Downloads/VyloShare`
-(configurable in Settings), integrity-checked with sha256; incomplete or corrupted
-transfers are discarded, never half-written into your folder.
+Three ways, all of which take files *and* folders:
+
+- **Drag off the edge of the screen** — start dragging in Finder/Explorer, move the
+  cursor across to the other machine and release: the items land on its Desktop.
+- **Drop onto the Vylo window** (drop overlay appears).
+- **Choose files… / Choose folder…** on the Status screen.
+
+Files land on the other machine in `~/Downloads/VyloShare` (configurable in Settings),
+integrity-checked with sha256. A folder arrives with its structure intact — subfolders,
+empty folders included — and appears only once every file inside has verified; if
+anything fails, nothing half-copied is left behind. Symbolic links inside a folder are
+skipped. Both machines need Vylo 1.0.5 or newer for folders.
 
 ## 6. Everyday use
 
@@ -102,7 +110,6 @@ If it does, re-tick both in *System Settings → Privacy & Security* and press R
 
 - Both machines must use the same sync port (default 4243); change it in
   `config.toml` (`sync_port`) on both if it collides with something.
-- Folders can't be sent directly — zip them first.
 - Clipboard sync covers text and images (not files-on-clipboard or rich text).
 - Very large clipboard images sync with a short delay (they are PNG-encoded).
 - A receiving Windows machine with no physical mouse attached may hide its cursor

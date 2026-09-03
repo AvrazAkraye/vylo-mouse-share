@@ -6,8 +6,9 @@ the edge of one screen and it appears on the other, Barrier/Synergy style — pl
 - **Per-device input tuning** — mouse speed and what your Ctrl / Alt / Cmd-Win keys act
   as on the other machine (e.g. ⌘ as Ctrl on Windows), set from either side
 - **Clipboard sync** — text and images, both directions, with echo prevention
-- **File transfer** — drag files onto the Vylo window (or use *Send files…*); they arrive
-  sha256-verified in `~/Downloads/VyloShare` on the other machine
+- **File and folder transfer** — drag them off the screen edge onto the other machine,
+  drop them onto the Vylo window, or pick them; they arrive sha256-verified (folders
+  whole, structure intact) in `~/Downloads/VyloShare` or on the Desktop
 - **PIN pairing** — a 6-digit PIN pairs exactly your two machines (SPAKE2, no offline
   brute-force), after which both channels are mutually authenticated end-to-end
 - **LAN-only** — traffic is DTLS/TLS-encrypted peer-to-peer; no servers, no telemetry,

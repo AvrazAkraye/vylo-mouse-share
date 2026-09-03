@@ -393,6 +393,16 @@ pub enum TransferState {
     Failed,
 }
 
+/// what a transfer row represents
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferKind {
+    #[default]
+    File,
+    /// a whole directory tree, reported as one transfer
+    Folder,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileTransferStatus {
     pub id: u64,
@@ -403,6 +413,11 @@ pub struct FileTransferStatus {
     pub state: TransferState,
     /// destination path when done (received), error message when failed
     pub detail: Option<String>,
+    #[serde(default)]
+    pub kind: TransferKind,
+    /// number of files inside a folder transfer (0 for a single file)
+    #[serde(default)]
+    pub files: u32,
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]

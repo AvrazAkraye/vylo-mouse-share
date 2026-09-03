@@ -10,6 +10,7 @@
 mod clipboard;
 mod discovery;
 mod files;
+mod inbox;
 mod keyboard;
 mod pairing;
 mod proto;
@@ -17,7 +18,7 @@ mod tls;
 
 use crate::crypto;
 use lan_mouse_ipc::{ClipboardKind, Direction, DiscoveredPeer, FileTransferStatus, TransferState};
-use proto::{PROTO_VERSION, SyncMessage, read_msg, write_msg};
+use proto::{PROTO_TREES, PROTO_VERSION, SyncMessage, read_msg, write_msg};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -33,7 +34,7 @@ use std::{
 use tokio::{
     io::{ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     task::{JoinHandle, spawn_local},
 };
 use tokio_rustls::{TlsStream, rustls::pki_types::ServerName};
@@ -51,9 +52,15 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 const PAIRING_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const OUT_QUEUE: usize = 32;
 
-static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
-fn next_transfer_id() -> u64 {
-    NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed)
+/// Transfer ids are only ever interpreted by the peer that issued them,
+/// but `FileCancel` flows both ways with just an id — so start from a
+/// random point rather than 1 to keep the two sides' id spaces from
+/// colliding when both machines send at once.
+static NEXT_TRANSFER_ID: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+pub(crate) fn next_transfer_id() -> u64 {
+    NEXT_TRANSFER_ID
+        .get_or_init(|| AtomicU64::new(rand::random::<u64>() >> 1))
+        .fetch_add(1, Ordering::Relaxed)
 }
 
 /// See [`crate::set_gui_host`]. Enables macOS keyboard-layout sync, which
@@ -333,6 +340,7 @@ async fn run_actor(
         peers_tx,
     };
     actor.start_discovery();
+    files::purge_stale_staging(&actor.file_dir.borrow().clone()).await;
 
     // Bind the listener without blocking the actor: if the port is
     // taken we still process requests (pairing as the dialing side,
@@ -430,15 +438,30 @@ impl Actor {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| path.display().to_string());
-                        self.events.send(SyncEvent::Transfer(files::status(
-                            next_transfer_id(),
-                            &name,
-                            Direction::Sent,
-                            0,
-                            0,
-                            TransferState::Failed,
-                            Some("no device connected".to_string()),
-                        )));
+                        let reason = Some("no device connected".to_string());
+                        let status = if path.is_dir() {
+                            files::tree_status(
+                                next_transfer_id(),
+                                &name,
+                                0,
+                                Direction::Sent,
+                                0,
+                                0,
+                                TransferState::Failed,
+                                reason,
+                            )
+                        } else {
+                            files::status(
+                                next_transfer_id(),
+                                &name,
+                                Direction::Sent,
+                                0,
+                                0,
+                                TransferState::Failed,
+                                reason,
+                            )
+                        };
+                        self.events.send(SyncEvent::Transfer(status));
                     }
                 }
             },
@@ -886,80 +909,6 @@ async fn pair_dial(
     Ok((peer_fp, peer_name, sock_addr.ip()))
 }
 
-/// Accept (or reject) an incoming file offer into `dir`, replying to the
-/// peer and reporting progress. Shared by plain transfers (`FileOffer`,
-/// `drag = None`) and staged drag files (`DragOffer`). Returns whether
-/// the transfer was accepted and registered in `recv`.
-#[allow(clippy::too_many_arguments)]
-async fn accept_offer(
-    dir: &std::path::Path,
-    id: u64,
-    name: &str,
-    size: u64,
-    drag: Option<u64>,
-    recv: &mut HashMap<u64, files::RecvTransfer>,
-    out_tx: &mpsc::Sender<SyncMessage>,
-    ctx: &ConnCtx,
-) -> bool {
-    // reject a reused id rather than orphaning the in-flight transfer's
-    // .vylopart file
-    if recv.contains_key(&id) {
-        let _ = out_tx
-            .send(SyncMessage::FileReject {
-                id,
-                reason: "transfer id already in use".to_string(),
-            })
-            .await;
-        return false;
-    }
-    match files::begin_recv(dir, name, size, drag).await {
-        Ok(transfer) => {
-            ctx.events.send(SyncEvent::Transfer(files::status(
-                id,
-                &transfer.name,
-                Direction::Received,
-                0,
-                size,
-                TransferState::Active,
-                None,
-            )));
-            recv.insert(id, transfer);
-            let _ = out_tx.send(SyncMessage::FileAccept { id }).await;
-            true
-        }
-        Err(reason) => {
-            ctx.events.send(SyncEvent::Transfer(files::status(
-                id,
-                name,
-                Direction::Received,
-                0,
-                size,
-                TransferState::Failed,
-                Some(reason.clone()),
-            )));
-            let _ = out_tx.send(SyncMessage::FileReject { id, reason }).await;
-            false
-        }
-    }
-}
-
-/// A staged drag file failed mid-transfer: take it off the drag's
-/// outstanding set so the drop can still finalize with the rest.
-async fn settle_drag_failure(
-    drag: Option<u64>,
-    id: u64,
-    incoming: &mut Option<files::IncomingDrag>,
-    ctx: &ConnCtx,
-) {
-    if let (Some(drag), Some(inc)) = (drag, incoming.as_mut()) {
-        if inc.drag == drag {
-            inc.outstanding.remove(&id);
-            let fallback = ctx.file_dir.borrow().clone();
-            files::try_finalize_drag(incoming, &fallback, &ctx.events).await;
-        }
-    }
-}
-
 /// Write one frame, bounded by [`WRITE_TIMEOUT`] and raced against
 /// cancellation. Returns false (caller tears down the connection) if the
 /// write fails, times out — a peer that stops reading must never block
@@ -989,15 +938,16 @@ async fn run_conn(stream: TlsStream<TcpStream>, outbound: bool, ctx: ConnCtx) {
     if write_msg(&mut w, &hello).await.is_err() {
         return;
     }
-    let peer_name = match tokio::time::timeout(Duration::from_secs(10), read_msg(&mut r)).await {
-        Ok(Ok(SyncMessage::Hello { version, name })) => {
-            if version != PROTO_VERSION {
-                log::warn!("peer runs sync protocol v{version}, expected v{PROTO_VERSION}");
+    let (peer_name, peer_version) =
+        match tokio::time::timeout(Duration::from_secs(10), read_msg(&mut r)).await {
+            Ok(Ok(SyncMessage::Hello { version, name })) => {
+                if version != PROTO_VERSION {
+                    log::warn!("peer runs sync protocol v{version}, expected v{PROTO_VERSION}");
+                }
+                (name, version)
             }
-            name
-        }
-        _ => return,
-    };
+            _ => return,
+        };
 
     let (out_tx, mut out_rx) = mpsc::channel::<SyncMessage>(OUT_QUEUE);
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ConnCtl>();
@@ -1034,7 +984,7 @@ async fn run_conn(stream: TlsStream<TcpStream>, outbound: bool, ctx: ConnCtx) {
     });
 
     /* reader */
-    reader_loop(&mut r, &out_tx, &mut ctl_rx, &cancel, &ctx).await;
+    reader_loop(&mut r, &out_tx, &mut ctl_rx, &cancel, &ctx, peer_version).await;
 
     cancel.cancel();
     let _ = writer.await;
@@ -1047,34 +997,57 @@ async fn reader_loop(
     ctl_rx: &mut mpsc::UnboundedReceiver<ConnCtl>,
     cancel: &CancellationToken,
     ctx: &ConnCtx,
+    peer_version: u16,
 ) {
-    /* incoming transfers, keyed by the peer's ids */
-    let mut recv: HashMap<u64, files::RecvTransfer> = HashMap::new();
-    /* outgoing transfers waiting for the peer to accept */
-    let mut awaiting_accept: HashMap<u64, oneshot::Sender<Result<(), String>>> = HashMap::new();
-    /* cross-machine drag-and-drop: the drag we are streaming out (source
-     * side) and the one we are staging (destination side). Kept here so
-     * they can never outlive the connection. */
+    /* everything the peer is sending us */
+    let mut inbox = inbox::Inbox::new(ctx.file_dir.clone(), ctx.events.clone());
+    /* outgoing transfers waiting on the peer (accept / reject / cancel) */
+    let outgoing = files::Outgoing::default();
+    /* the cross-machine drag we are streaming out (source side); kept
+     * here so it can never outlive the connection */
     let mut outgoing_drag: Option<u64> = None;
-    let mut incoming_drag: Option<files::IncomingDrag> = None;
 
-    // spawn the per-file sender; `drag` tags the offer as staged
-    let start_send =
-        |path: PathBuf,
-         drag: Option<u64>,
-         awaiting_accept: &mut HashMap<u64, oneshot::Sender<Result<(), String>>>| {
-            let id = next_transfer_id();
-            let (accept_tx, accept_rx) = oneshot::channel();
-            awaiting_accept.insert(id, accept_tx);
-            spawn_local(files::send_file(
-                id,
-                path,
-                out_tx.clone(),
-                accept_rx,
-                ctx.events.clone(),
-                drag,
-            ));
-        };
+    // spawn the per-file sender
+    let start_send = |path: PathBuf, offer: files::Offer| {
+        spawn_local(files::send_file(
+            next_transfer_id(),
+            path,
+            out_tx.clone(),
+            outgoing.clone(),
+            offer,
+            files::Report::Single(ctx.events.clone()),
+        ));
+    };
+    // spawn the folder sender
+    let start_tree = |path: PathBuf, drag: Option<u64>| {
+        spawn_local(files::send_tree(
+            next_transfer_id(),
+            path,
+            drag,
+            out_tx.clone(),
+            outgoing.clone(),
+            ctx.events.clone(),
+        ));
+    };
+    // a folder can only go to a peer that speaks the tree messages; an
+    // older peer would drop the connection on the first unknown variant
+    let peer_takes_trees = peer_version >= PROTO_TREES;
+    let refuse_tree = |path: &PathBuf| {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "folder".to_string());
+        ctx.events.send(SyncEvent::Transfer(files::tree_status(
+            next_transfer_id(),
+            &name,
+            0,
+            Direction::Sent,
+            0,
+            0,
+            TransferState::Failed,
+            Some("the other machine runs an older Vylo — update it to receive folders".to_string()),
+        )));
+    };
 
     loop {
         let msg = tokio::select! {
@@ -1083,20 +1056,46 @@ async fn reader_loop(
                 match ctl {
                     ConnCtl::SendFiles(paths) => {
                         for path in paths {
-                            start_send(path, None, &mut awaiting_accept);
+                            if path.is_dir() {
+                                if peer_takes_trees {
+                                    start_tree(path, None);
+                                } else {
+                                    refuse_tree(&path);
+                                }
+                            } else {
+                                start_send(path, files::Offer::Plain);
+                            }
                         }
                     }
                     ConnCtl::DragFiles(paths) => {
+                        // only announce what we can actually deliver
+                        let (dirs, plain): (Vec<PathBuf>, Vec<PathBuf>) =
+                            paths.into_iter().partition(|p| p.is_dir());
+                        let mut items = plain;
+                        for d in dirs {
+                            if peer_takes_trees {
+                                items.push(d);
+                            } else {
+                                refuse_tree(&d);
+                            }
+                        }
+                        if items.is_empty() {
+                            continue;
+                        }
                         let drag = next_transfer_id();
                         outgoing_drag = Some(drag);
                         let _ = out_tx
                             .send(SyncMessage::DragBegin {
                                 drag,
-                                count: paths.len() as u32,
+                                count: items.len() as u32,
                             })
                             .await;
-                        for path in paths {
-                            start_send(path, Some(drag), &mut awaiting_accept);
+                        for path in items {
+                            if path.is_dir() {
+                                start_tree(path, Some(drag));
+                            } else {
+                                start_send(path, files::Offer::Drag(drag));
+                            }
                         }
                     }
                     ConnCtl::DragDrop => {
@@ -1157,233 +1156,19 @@ async fn reader_loop(
                 }
             }
 
-            SyncMessage::FileOffer { id, name, size } => {
-                let dir = ctx.file_dir.borrow().clone();
-                accept_offer(&dir, id, &name, size, None, &mut recv, out_tx, ctx).await;
+            /* replies to transfers we are sending */
+            SyncMessage::FileAccept { id } => outgoing.accepted(id),
+            SyncMessage::FileReject { id, reason } => outgoing.rejected(id, reason),
+            // FileCancel is sent by whichever side gives up; ours are
+            // whatever isn't an incoming transfer of that id
+            SyncMessage::FileCancel { id, reason } if !inbox.has_transfer(id) => {
+                if !outgoing.aborted(id, reason) {
+                    log::debug!("FileCancel for unknown transfer {id}");
+                }
             }
 
-            /* ---- cross-machine drag-and-drop (destination side) ---- */
-            SyncMessage::DragBegin { drag, count } => {
-                // a new drag supersedes any staged one that never resolved
-                if let Some(old) = incoming_drag.take() {
-                    log::warn!("drag {} superseded before it resolved", old.drag);
-                    for id in &old.outstanding {
-                        if let Some(t) = recv.remove(id) {
-                            let _ = tokio::fs::remove_file(&t.part_path).await;
-                        }
-                    }
-                    files::discard_drag(old).await;
-                }
-                let dir = ctx.file_dir.borrow().join(format!(".vylo-drag-{drag}"));
-                if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-                    log::warn!("cannot create drag staging dir {}: {e}", dir.display());
-                    continue;
-                }
-                log::info!("incoming drag {drag}: {count} file(s)");
-                incoming_drag = Some(files::IncomingDrag {
-                    drag,
-                    dir,
-                    expected: count,
-                    offered: 0,
-                    outstanding: HashSet::new(),
-                    done: Vec::new(),
-                    drop_requested: false,
-                });
-            }
-            SyncMessage::DragOffer {
-                drag,
-                id,
-                name,
-                size,
-            } => {
-                let Some(inc) = incoming_drag.as_mut().filter(|d| d.drag == drag) else {
-                    let _ = out_tx
-                        .send(SyncMessage::FileReject {
-                            id,
-                            reason: "no drag in progress".to_string(),
-                        })
-                        .await;
-                    continue;
-                };
-                inc.offered += 1;
-                let dir = inc.dir.clone();
-                if accept_offer(&dir, id, &name, size, Some(drag), &mut recv, out_tx, ctx).await {
-                    if let Some(inc) = incoming_drag.as_mut() {
-                        inc.outstanding.insert(id);
-                    }
-                } else {
-                    // a rejected offer has settled; the drop may now be complete
-                    let fallback = ctx.file_dir.borrow().clone();
-                    files::try_finalize_drag(&mut incoming_drag, &fallback, &ctx.events).await;
-                }
-            }
-            SyncMessage::DragDrop { drag } => {
-                if let Some(inc) = incoming_drag.as_mut().filter(|d| d.drag == drag) {
-                    inc.drop_requested = true;
-                    let fallback = ctx.file_dir.borrow().clone();
-                    files::try_finalize_drag(&mut incoming_drag, &fallback, &ctx.events).await;
-                }
-            }
-            SyncMessage::DragCancel { drag } => {
-                if incoming_drag.as_ref().is_some_and(|d| d.drag == drag) {
-                    let d = incoming_drag.take().expect("checked");
-                    log::info!("drag {drag} cancelled by peer; discarding staged files");
-                    for id in &d.outstanding {
-                        if let Some(t) = recv.remove(id) {
-                            let _ = tokio::fs::remove_file(&t.part_path).await;
-                        }
-                    }
-                    files::discard_drag(d).await;
-                }
-            }
-            SyncMessage::FileChunk { id, offset, data } => {
-                use sha2::Digest;
-                use tokio::io::AsyncWriteExt;
-                let Some(transfer) = recv.get_mut(&id) else {
-                    continue;
-                };
-                // Bound the write by the offered size and per-chunk size:
-                // without this a peer could stream unbounded chunks (or a
-                // huge single frame) and fill the receiver's disk.
-                let overflows = data.len() > proto::CHUNK_SIZE
-                    || transfer.received + data.len() as u64 > transfer.size;
-                if overflows {
-                    let reason = "transfer exceeds offered size".to_string();
-                    ctx.events.send(SyncEvent::Transfer(files::status(
-                        id,
-                        &transfer.name,
-                        Direction::Received,
-                        transfer.received,
-                        transfer.size,
-                        TransferState::Failed,
-                        Some(reason.clone()),
-                    )));
-                    let _ = out_tx.send(SyncMessage::FileCancel { id, reason }).await;
-                    let t = recv.remove(&id).expect("transfer");
-                    let _ = tokio::fs::remove_file(&t.part_path).await;
-                    settle_drag_failure(t.drag, id, &mut incoming_drag, ctx).await;
-                    continue;
-                }
-                if offset != transfer.received {
-                    let reason = "chunks out of order".to_string();
-                    ctx.events.send(SyncEvent::Transfer(files::status(
-                        id,
-                        &transfer.name,
-                        Direction::Received,
-                        transfer.received,
-                        transfer.size,
-                        TransferState::Failed,
-                        Some(reason.clone()),
-                    )));
-                    let _ = out_tx.send(SyncMessage::FileCancel { id, reason }).await;
-                    let t = recv.remove(&id).expect("transfer");
-                    let _ = tokio::fs::remove_file(&t.part_path).await;
-                    settle_drag_failure(t.drag, id, &mut incoming_drag, ctx).await;
-                    continue;
-                }
-                transfer.hasher.update(&data);
-                if let Err(e) = transfer.file.write_all(&data).await {
-                    let reason = format!("write failed: {e}");
-                    ctx.events.send(SyncEvent::Transfer(files::status(
-                        id,
-                        &transfer.name,
-                        Direction::Received,
-                        transfer.received,
-                        transfer.size,
-                        TransferState::Failed,
-                        Some(reason.clone()),
-                    )));
-                    let _ = out_tx.send(SyncMessage::FileCancel { id, reason }).await;
-                    let t = recv.remove(&id).expect("transfer");
-                    let _ = tokio::fs::remove_file(&t.part_path).await;
-                    settle_drag_failure(t.drag, id, &mut incoming_drag, ctx).await;
-                    continue;
-                }
-                transfer.received += data.len() as u64;
-                if transfer.progress_due() {
-                    ctx.events.send(SyncEvent::Transfer(files::status(
-                        id,
-                        &transfer.name,
-                        Direction::Received,
-                        transfer.received,
-                        transfer.size,
-                        TransferState::Active,
-                        None,
-                    )));
-                }
-            }
-            SyncMessage::FileDone { id, sha256 } => {
-                let Some(transfer) = recv.remove(&id) else {
-                    continue;
-                };
-                let name = transfer.name.clone();
-                let size = transfer.size;
-                let drag = transfer.drag;
-                let result = files::finish_recv(transfer, sha256).await;
-                match &result {
-                    Ok(path) => ctx.events.send(SyncEvent::Transfer(files::status(
-                        id,
-                        &name,
-                        Direction::Received,
-                        size,
-                        size,
-                        TransferState::Done,
-                        Some(path.display().to_string()),
-                    ))),
-                    Err(reason) => ctx.events.send(SyncEvent::Transfer(files::status(
-                        id,
-                        &name,
-                        Direction::Received,
-                        size,
-                        size,
-                        TransferState::Failed,
-                        Some(reason.clone()),
-                    ))),
-                }
-                // a staged drag file has settled (done or failed)
-                if let (Some(drag), Some(inc)) = (drag, incoming_drag.as_mut()) {
-                    if inc.drag == drag {
-                        inc.outstanding.remove(&id);
-                        if let Ok(path) = result {
-                            inc.done.push(path);
-                        }
-                        let fallback = ctx.file_dir.borrow().clone();
-                        files::try_finalize_drag(&mut incoming_drag, &fallback, &ctx.events).await;
-                    }
-                }
-            }
-            SyncMessage::FileCancel { id, reason } => {
-                if let Some(t) = recv.remove(&id) {
-                    ctx.events.send(SyncEvent::Transfer(files::status(
-                        id,
-                        &t.name,
-                        Direction::Received,
-                        t.received,
-                        t.size,
-                        TransferState::Failed,
-                        Some(reason),
-                    )));
-                    let _ = tokio::fs::remove_file(&t.part_path).await;
-                    if let (Some(drag), Some(inc)) = (t.drag, incoming_drag.as_mut()) {
-                        if inc.drag == drag {
-                            inc.outstanding.remove(&id);
-                            let fallback = ctx.file_dir.borrow().clone();
-                            files::try_finalize_drag(&mut incoming_drag, &fallback, &ctx.events)
-                                .await;
-                        }
-                    }
-                }
-            }
-            SyncMessage::FileAccept { id } => {
-                if let Some(tx) = awaiting_accept.remove(&id) {
-                    let _ = tx.send(Ok(()));
-                }
-            }
-            SyncMessage::FileReject { id, reason } => {
-                if let Some(tx) = awaiting_accept.remove(&id) {
-                    let _ = tx.send(Err(reason));
-                }
-            }
+            /* transfers the peer is sending us */
+            msg if inbox::is_inbound_transfer(&msg) => inbox.handle(msg, out_tx).await,
 
             /* pairing messages are only valid on pairing connections */
             SyncMessage::PairStart { .. }
@@ -1392,27 +1177,12 @@ async fn reader_loop(
             | SyncMessage::PairConfirmB { .. } => {
                 log::warn!("unexpected pairing message on established connection");
             }
+            other => log::debug!("unhandled sync message {other:?}"),
         }
     }
 
-    /* clean up unfinished incoming transfers */
-    for (id, t) in recv {
-        ctx.events.send(SyncEvent::Transfer(files::status(
-            id,
-            &t.name,
-            Direction::Received,
-            t.received,
-            t.size,
-            TransferState::Failed,
-            Some("connection closed".to_string()),
-        )));
-        let _ = tokio::fs::remove_file(&t.part_path).await;
-    }
-    /* a drag can't survive its connection: discard whatever was staged */
-    if let Some(d) = incoming_drag.take() {
-        log::info!("drag {} abandoned: connection closed", d.drag);
-        files::discard_drag(d).await;
-    }
+    /* nothing in flight can complete without the connection */
+    inbox.close().await;
 }
 
 #[cfg(test)]

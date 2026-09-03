@@ -41,11 +41,11 @@ pub async fn pick_files(app: AppHandle) -> Result<Option<Vec<String>>, String> {
 
 /// Native folder picker; `None` when cancelled.
 #[tauri::command]
-pub async fn pick_dir(app: AppHandle) -> Result<Option<String>, String> {
+pub async fn pick_dir(app: AppHandle, title: Option<String>) -> Result<Option<String>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .set_title("Choose folder for received files")
+        .set_title(title.as_deref().unwrap_or("Choose folder for received files"))
         .pick_folder(move |path| {
             let _ = tx.send(path);
         });
