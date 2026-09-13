@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { Download, RefreshCw, CheckCircle2, AlertTriangle } from "lucide-react";
 import { Card, CardBody, CardHeader } from "./ui/card";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import { Progress } from "./ui/progress";
+import { backend } from "../lib/ipc";
 import { useAppVersion } from "../lib/store";
 
 type Phase =
@@ -57,7 +57,7 @@ export function UpdateCard() {
           setPhase({ kind: "installing" });
         }
       });
-      await relaunch();
+      await backend.relaunchForUpdate();
     } catch (e) {
       setPhase({ kind: "error", message: humanize(e) });
     }

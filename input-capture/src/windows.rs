@@ -41,7 +41,9 @@ impl Capture for WindowsInputCapture {
 
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
+        // generous buffer: a full channel makes the hook callback block,
+        // and a hook callback that blocks for 300 ms is dropped by windows
+        let (event_tx, event_rx) = channel(256);
         let event_thread = EventThread::new(event_tx);
         Self {
             event_thread,

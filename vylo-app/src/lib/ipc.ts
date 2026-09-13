@@ -276,6 +276,10 @@ export const backend = {
   openFileDir: (path: string) => invoke<void>("open_file_dir", { path }),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
   getAutostart: () => invoke<boolean>("get_autostart"),
+  setStartHidden: (enabled: boolean) => invoke<void>("set_start_hidden", { enabled }),
+  getStartHidden: () => invoke<boolean>("get_start_hidden"),
+  /** restart into an installed update (never resolves: the app exits) */
+  relaunchForUpdate: () => invoke<void>("relaunch_for_update"),
   getPlatform: () => invoke<string>("get_platform"),
   ipcConnected: () => invoke<boolean>("ipc_connected"),
 };

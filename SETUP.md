@@ -83,11 +83,28 @@ empty folders included — and appears only once every file inside has verified;
 anything fails, nothing half-copied is left behind. Symbolic links inside a folder are
 skipped. Both machines need Vylo 1.0.5 or newer for folders.
 
-## 6. Everyday use
+## 6. Everyday use — Vylo runs in the background
 
-Vylo lives in the menu bar (macOS) / system tray (Windows): connection status,
-clipboard toggle, received-files folder, quit. Closing the window hides it — the app
-keeps running. Enable **Start on login** in Settings on both machines and forget it.
+Vylo is a background service with a window, not the other way round. It lives in the
+menu bar (macOS) / system tray (Windows): connection status, clipboard toggle,
+received-files folder, quit.
+
+- **Closing the window** hides it; sharing keeps running. Reopen from the tray icon
+  (*Show Vylo*), or by launching the app again.
+- **Minimizing on Windows** sends it to the tray rather than the taskbar — same thing,
+  one place to find it.
+- **Start on login** (Settings) launches Vylo straight into the background at sign-in,
+  with no window. Turn it on on both machines and forget it.
+- **Start in background** (Settings) does the same for launches you start yourself.
+- Launching Vylo while it is already running reveals the running copy instead of
+  starting a second one.
+
+Sharing, clipboard and file transfer work the whole time the window is away. On
+Windows that takes deliberate effort: the system throttles processes with no visible
+window, and a throttled app has its keyboard/mouse hooks silently revoked — which is
+what used to make a minimized Vylo stop responding at the screen edge. Vylo now opts
+its process out of that throttling and re-registers the hooks within a couple of
+seconds if Windows drops them anyway.
 
 ## 7. Updating
 

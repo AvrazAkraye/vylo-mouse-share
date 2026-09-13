@@ -68,6 +68,22 @@ every artifact is minisign-signed in CI and verified against the public key embe
 in `tauri.conf.json` before install. This is the only non-LAN connection the app
 makes, and only on user action (or when Settings is opened).
 
+**Runs as a background service** — the app starts into the tray/menu bar (always at
+login, optionally on a manual launch), a second launch reveals the running instance
+instead of starting another one (`tauri-plugin-single-instance`, plus macOS `Reopen`),
+and on Windows minimizing goes to the tray. Making that *work* needed two Windows
+fixes upstream does not have:
+- `src/background.rs` — the process opts out of EcoQoS/power throttling
+  (`ProcessPowerThrottling`). Windows throttles processes with no visible window, and a
+  throttled process misses the `LowLevelHooksTimeout` deadline, after which Windows
+  silently revokes its input hooks: a minimized lan-mouse simply stops capturing.
+- `input-capture/src/windows/event_thread.rs` — the hook thread runs time-critical and
+  un-throttled, and a 1 s watchdog compares the hooks' last callback against
+  `GetLastInputInfo()` to detect hooks Windows has dropped and re-register them (plus a
+  periodic refresh while nothing is being captured, where a dropped hook cannot be
+  detected that way). The capture event channel was also widened so a hook callback
+  cannot block on a full channel.
+
 ## Security fix to upstream
 
 Upstream's **outbound** DTLS connection set `insecure_skip_verify` with no server

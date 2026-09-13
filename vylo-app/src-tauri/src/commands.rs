@@ -85,6 +85,35 @@ pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
+/// Whether a manual launch should go straight to the tray.
+#[tauri::command]
+pub fn get_start_hidden(app: AppHandle) -> bool {
+    crate::prefs::load(&app).start_hidden
+}
+
+#[tauri::command]
+pub fn set_start_hidden(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut prefs = crate::prefs::load(&app);
+    prefs.start_hidden = enabled;
+    crate::prefs::store(&app, prefs)
+}
+
+/// Restart into a freshly installed update.
+///
+/// Tauri relaunches with the arguments this process was started with, so an
+/// app that the login item started with `--hidden` would come back invisible
+/// right after the user pressed *Update* in its window. Remember that the
+/// window is open before handing over.
+#[tauri::command]
+pub fn relaunch_for_update(app: AppHandle) {
+    let mut prefs = crate::prefs::load(&app);
+    prefs.show_on_next_start = true;
+    if let Err(e) = crate::prefs::store(&app, prefs) {
+        log::warn!("could not remember the window state across the update: {e}");
+    }
+    app.restart()
+}
+
 #[tauri::command]
 pub fn get_platform() -> String {
     std::env::consts::OS.to_string()

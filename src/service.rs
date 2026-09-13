@@ -86,6 +86,10 @@ struct Incoming {
 
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
+        // the service has to keep capturing and syncing with no window on
+        // screen, so it must not be demoted to a background process
+        crate::background::opt_out_of_throttling();
+
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);

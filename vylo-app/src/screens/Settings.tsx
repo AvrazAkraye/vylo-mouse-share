@@ -9,7 +9,7 @@ import { Dialog } from "../components/ui/dialog";
 import { PeerInputCard } from "../components/PeerInputCard";
 import { UpdateCard } from "../components/UpdateCard";
 import { backend, requests } from "../lib/ipc";
-import { useDaemon } from "../lib/store";
+import { useDaemon, usePlatform } from "../lib/store";
 import { copyText, shortFingerprint } from "../lib/utils";
 
 function Row({
@@ -34,6 +34,8 @@ function Row({
 
 export function SettingsScreen() {
   const s = useDaemon();
+  const platform = usePlatform();
+  const trayName = platform === "macos" ? "menu bar" : "system tray";
 
   /* Device name (commit on blur) */
   const [name, setName] = useState("");
@@ -67,6 +69,23 @@ export function SettingsScreen() {
       setAutostart(await backend.getAutostart());
     } catch {
       setAutostart(!v);
+    }
+  };
+
+  /* Start straight to the tray (a login start always does) */
+  const [startHidden, setStartHidden] = useState<boolean | null>(null);
+  useEffect(() => {
+    backend
+      .getStartHidden()
+      .then(setStartHidden)
+      .catch(() => setStartHidden(null));
+  }, []);
+  const toggleStartHidden = async (v: boolean) => {
+    setStartHidden(v); // optimistic
+    try {
+      await backend.setStartHidden(v);
+    } catch {
+      setStartHidden(!v);
     }
   };
 
@@ -158,12 +177,26 @@ export function SettingsScreen() {
               onCheckedChange={(v) => requests.setKeyboardLayoutSync(v)}
             />
           </Row>
-          <Row label="Start on login" hint="Launch Vylo when you sign in">
+          <Row
+            label="Start on login"
+            hint="Launch Vylo when you sign in, straight to the background"
+          >
             <Switch
               checked={autostart ?? false}
               disabled={autostart === null}
               aria-label="Start on login"
               onCheckedChange={toggleAutostart}
+            />
+          </Row>
+          <Row
+            label="Start in background"
+            hint={`Open with no window at all. Vylo keeps sharing while it sits in the ${trayName}; reopen it from there.`}
+          >
+            <Switch
+              checked={startHidden ?? false}
+              disabled={startHidden === null}
+              aria-label="Start in background"
+              onCheckedChange={toggleStartHidden}
             />
           </Row>
         </CardBody>

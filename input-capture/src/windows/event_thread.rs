@@ -1,9 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::ffi::c_void;
 use std::ptr::addr_of_mut;
 
 use std::default::Default;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::sync::mpsc::Sender;
@@ -14,16 +15,23 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayDevicesW, EnumDisplaySettingsW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::Threading::{
+    GetCurrentThread, GetCurrentThreadId, SetThreadInformation, SetThreadPriority,
+    THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+    THREAD_POWER_THROTTLING_STATE, THREAD_PRIORITY_TIME_CRITICAL, ThreadPowerThrottling,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    HHOOK, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
+    RegisterClassW, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
 };
 
 use input_event::{
@@ -122,6 +130,142 @@ thread_local! {
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
     static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
+    /// the currently registered low level hooks (mouse, keyboard)
+    static HOOKS: Cell<(Option<HHOOK>, Option<HHOOK>)> = const { Cell::new((None, None)) };
+}
+
+/// `GetTickCount()` at the last hook callback, used by the watchdog below.
+static LAST_HOOK_TICK: AtomicU32 = AtomicU32::new(0);
+/// `GetTickCount()` at the last (re)registration of the hooks
+static LAST_INSTALL_TICK: AtomicU32 = AtomicU32::new(0);
+
+/// watchdog timer, see [`check_hooks_alive`]
+const WATCHDOG_TIMER_ID: usize = 1;
+const WATCHDOG_INTERVAL_MS: u32 = 1000;
+/// how far our hooks may lag the system's own last-input time before they
+/// are considered dead
+const HOOK_STALE_MS: i32 = 1500;
+/// how often the hooks are refreshed while nothing is being captured
+const HOOK_REFRESH_MS: i32 = 60_000;
+
+/// Register both low level hooks, replacing any previous registration.
+///
+/// Called once at startup and again whenever the watchdog notices Windows
+/// has dropped the hooks.
+fn install_hooks() {
+    unsafe {
+        // release whatever is left of a previous registration
+        let (mouse, keyboard) = HOOKS.with(|hooks| hooks.take());
+        if let Some(hook) = mouse {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+        if let Some(hook) = keyboard {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+
+        let mouse_proc: HOOKPROC = Some(mouse_proc);
+        let kybrd_proc: HOOKPROC = Some(kybrd_proc);
+        let mouse = match SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0) {
+            Ok(hook) => Some(hook),
+            Err(e) => {
+                log::error!("failed to register mouse hook: {e}");
+                None
+            }
+        };
+        let keyboard = match SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0) {
+            Ok(hook) => Some(hook),
+            Err(e) => {
+                log::error!("failed to register keyboard hook: {e}");
+                None
+            }
+        };
+        HOOKS.with(|hooks| hooks.set((mouse, keyboard)));
+        // the hooks are live as of now - don't let the watchdog see the
+        // previous (stale) timestamp and immediately reinstall again
+        let now = GetTickCount();
+        LAST_HOOK_TICK.store(now, Ordering::Relaxed);
+        LAST_INSTALL_TICK.store(now, Ordering::Relaxed);
+    }
+}
+
+fn uninstall_hooks() {
+    let (mouse, keyboard) = HOOKS.with(|hooks| hooks.take());
+    unsafe {
+        if let Some(hook) = mouse {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+        if let Some(hook) = keyboard {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+    }
+}
+
+/// Detect hooks that Windows has silently removed and put them back.
+///
+/// A low level hook whose callback does not return within
+/// `LowLevelHooksTimeout` (300 ms by default) is dropped by Windows without
+/// any notification - the app just stops seeing input forever. That happens
+/// exactly when the machine is busy or the process gets throttled, i.e.
+/// while Vylo sits minimized in the tray. There is no API to ask whether a
+/// hook is still installed, so compare our own last callback against the
+/// system's last input time: if the system has seen input well after we
+/// last did, the hooks are gone.
+fn check_hooks_alive() {
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if !unsafe { GetLastInputInfo(addr_of_mut!(info)) }.as_bool() {
+        return;
+    }
+    let last_hook = LAST_HOOK_TICK.load(Ordering::Relaxed);
+    // tick counts wrap every ~49 days, hence wrapping_sub
+    let behind = info.dwTime.wrapping_sub(last_hook) as i32;
+    if behind > HOOK_STALE_MS {
+        log::warn!("input hooks missed {behind} ms of input - reinstalling");
+        return install_hooks();
+    }
+
+    // Belt and braces: the check above cannot see Windows dropping only
+    // one of the two hooks, because the surviving one keeps the timestamp
+    // fresh. So re-register them from time to time anyway — but only while
+    // no client is active, since the moment between unhook and hook could
+    // otherwise leak a click to this machine instead of the peer.
+    if ACTIVE_CLIENT.get().is_some() {
+        return;
+    }
+    let since_install =
+        unsafe { GetTickCount() }.wrapping_sub(LAST_INSTALL_TICK.load(Ordering::Relaxed)) as i32;
+    if since_install > HOOK_REFRESH_MS {
+        log::debug!("refreshing input hooks");
+        install_hooks();
+    }
+}
+
+/// Make this thread as hard to throttle as possible: the hook callbacks
+/// have to answer within `LowLevelHooksTimeout` even when the process has no
+/// window on screen and Windows would rather run it on an efficiency core.
+fn prepare_hook_thread() {
+    unsafe {
+        let thread = GetCurrentThread();
+        if let Err(e) = SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL) {
+            log::warn!("could not raise input thread priority: {e}");
+        }
+        let state = THREAD_POWER_THROTTLING_STATE {
+            Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: 0, // managed by us, throttling off
+        };
+        let res = SetThreadInformation(
+            thread,
+            ThreadPowerThrottling,
+            &state as *const THREAD_POWER_THROTTLING_STATE as *const c_void,
+            std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        );
+        if let Err(e) = res {
+            log::debug!("could not disable input thread throttling: {e}");
+        }
+    }
 }
 
 fn get_msg() -> Option<MSG> {
@@ -169,15 +313,13 @@ fn start_routine(
         cnd.notify_one();
     }
 
-    let mouse_proc: HOOKPROC = Some(mouse_proc);
-    let kybrd_proc: HOOKPROC = Some(kybrd_proc);
     let window_proc: WNDPROC = Some(window_proc);
 
+    /* keep this thread responsive enough for the low level hooks */
+    prepare_hook_thread();
+
     /* register hooks */
-    unsafe {
-        let _ = SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0).unwrap();
-        let _ = SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0).unwrap();
-    }
+    install_hooks();
 
     let instance = unsafe { GetModuleHandleW(None).unwrap() };
     let instance = instance.into();
@@ -202,8 +344,8 @@ fn start_routine(
         }
     }
 
-    /* window is used ro receive WM_DISPLAYCHANGE messages */
-    unsafe {
+    /* window is used ro receive WM_DISPLAYCHANGE and WM_TIMER messages */
+    let window = unsafe {
         CreateWindowExW(
             Default::default(),
             w!("lan-mouse-message-window-class"),
@@ -218,7 +360,12 @@ fn start_routine(
             Some(instance),
             None,
         )
-        .expect("CreateWindowExW");
+        .expect("CreateWindowExW")
+    };
+
+    /* watchdog: put the hooks back if windows drops them */
+    if unsafe { SetTimer(Some(window), WATCHDOG_TIMER_ID, WATCHDOG_INTERVAL_MS, None) } == 0 {
+        log::warn!("failed to start the input hook watchdog");
     }
 
     /* run message loop */
@@ -255,6 +402,8 @@ fn start_routine(
             }
         }
     }
+
+    uninstall_hooks();
 }
 
 fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
@@ -305,6 +454,9 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    /* first thing: tell the watchdog the hook is alive */
+    LAST_HOOK_TICK.store(unsafe { GetTickCount() }, Ordering::Relaxed);
+
     let active = check_client_activation(wparam, lparam);
 
     /* no client was active */
@@ -332,6 +484,9 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    /* first thing: tell the watchdog the hook is alive */
+    LAST_HOOK_TICK.store(unsafe { GetTickCount() }, Ordering::Relaxed);
+
     /* get active client if any */
     let Some(client) = ACTIVE_CLIENT.get() else {
         return CallNextHookEx(None, ncode, wparam, lparam);
@@ -353,12 +508,14 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 unsafe extern "system" fn window_proc(
     _hwnd: HWND,
     uint: u32,
-    _wparam: WPARAM,
+    wparam: WPARAM,
     _lparam: LPARAM,
 ) -> LRESULT {
     if uint == WM_DISPLAYCHANGE {
         log::debug!("display resolution changed");
         DISPLAY_RESOLUTION_GENERATION.fetch_add(1, Ordering::Release);
+    } else if uint == WM_TIMER && wparam.0 == WATCHDOG_TIMER_ID {
+        check_hooks_alive();
     }
     LRESULT(1)
 }
