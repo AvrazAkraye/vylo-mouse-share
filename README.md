@@ -1,5 +1,12 @@
 # Vylo Mouse Share
 
+<p align="center">
+  <a href="docs/media/vylo-mouse-share.mp4">
+    <img src="docs/media/vylo-mouse-share.gif" width="800"
+         alt="Vylo Mouse Share in 15 seconds: the cursor moves from a Mac onto a Windows PC, a PDF is dragged across, and text copied on the Mac is pasted on the PC">
+  </a>
+</p>
+
 Share one mouse and keyboard between two machines on the same LAN — move the cursor off
 the edge of one screen and it appears on the other, Barrier/Synergy style — plus:
 
