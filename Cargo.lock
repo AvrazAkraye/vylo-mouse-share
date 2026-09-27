@@ -6102,7 +6102,7 @@ dependencies = [
 
 [[package]]
 name = "vylo-app"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "env_logger",
  "lan-mouse-ipc",
@@ -6119,11 +6119,12 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "vylo-mouse-share",
+ "windows",
 ]
 
 [[package]]
 name = "vylo-mouse-share"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "arboard",
  "bincode",
@@ -6146,6 +6147,7 @@ dependencies = [
  "log",
  "mdns-sd",
  "notify",
+ "objc2-foundation",
  "png 0.17.16",
  "rand",
  "rcgen",

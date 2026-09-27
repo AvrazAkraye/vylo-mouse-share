@@ -22,6 +22,9 @@ pub struct Prefs {
     /// on the next start even if this launch came from the login item.
     /// Cleared as soon as it is read.
     pub show_on_next_start: bool,
+    /// Windows only: run as administrator so the peer's mouse can use apps
+    /// that run as administrator. See `elevation.rs`.
+    pub run_as_admin: bool,
 }
 
 fn path(app: &AppHandle) -> Option<PathBuf> {
@@ -33,7 +36,21 @@ pub fn load(app: &AppHandle) -> Prefs {
     let Some(path) = path(app) else {
         return Prefs::default();
     };
-    match std::fs::read_to_string(&path) {
+    read(&path)
+}
+
+/// [`load`] for the moment before Tauri starts, when there is no
+/// `AppHandle` yet. Same file: Tauri's config dir is `%APPDATA%\<identifier>`.
+#[cfg(windows)]
+pub fn load_early() -> Prefs {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return Prefs::default();
+    };
+    read(&PathBuf::from(appdata).join("com.vylo.mouseshare").join("app.json"))
+}
+
+fn read(path: &std::path::Path) -> Prefs {
+    match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
             log::warn!("ignoring unreadable {}: {e}", path.display());
             Prefs::default()

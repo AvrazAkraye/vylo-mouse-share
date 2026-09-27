@@ -12,7 +12,7 @@ members = [
 [package]
 name = "vylo-mouse-share"
 description = "Vylo Mouse Share — mouse, keyboard, clipboard and file sharing between two machines on a LAN"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/AvrazAkraye/vylo-mouse-share"
@@ -95,6 +95,12 @@ libc = "0.2.148"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.0"
 core-foundation-sys = "0.8.6"
+# App Nap opt-out while the window is hidden (see src/background.rs)
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSProcessInfo",
+    "NSString",
+] }
 
 # keyboard-layout sync: read/activate the active keyboard layout
 [target.'cfg(windows)'.dependencies]

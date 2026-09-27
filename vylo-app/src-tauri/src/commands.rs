@@ -73,6 +73,23 @@ pub fn open_file_dir(app: AppHandle, path: String) -> Result<(), String> {
 #[tauri::command]
 pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     let autolaunch = app.autolaunch();
+
+    // admin mode: the login item is the elevated task (see elevation.rs)
+    #[cfg(windows)]
+    if crate::prefs::load(&app).run_as_admin {
+        if crate::elevation::is_elevated() {
+            let _ = autolaunch.disable();
+            return if enabled {
+                crate::elevation::create_task()
+            } else {
+                crate::elevation::delete_task()
+            };
+        }
+        if !enabled {
+            crate::elevation::delete_task()?;
+        }
+    }
+
     if enabled {
         autolaunch.enable().map_err(|e| e.to_string())
     } else {
@@ -82,7 +99,108 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    #[cfg(windows)]
+    if crate::prefs::load(&app).run_as_admin && crate::elevation::task_exists() {
+        return Ok(true);
+    }
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+/// State of "Control admin windows" for the settings screen.
+#[derive(serde::Serialize)]
+pub struct AdminMode {
+    /// only Windows has this setting
+    supported: bool,
+    /// the preference
+    enabled: bool,
+    /// whether this copy actually runs as administrator right now
+    elevated: bool,
+}
+
+#[tauri::command]
+pub fn get_admin_mode(app: AppHandle) -> AdminMode {
+    #[cfg(windows)]
+    return AdminMode {
+        supported: true,
+        enabled: crate::prefs::load(&app).run_as_admin,
+        elevated: crate::elevation::is_elevated(),
+    };
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        AdminMode {
+            supported: false,
+            enabled: false,
+            elevated: false,
+        }
+    }
+}
+
+/// Turn "Control admin windows" on or off.
+///
+/// Turning it on from a normal copy asks for permission through UAC, then
+/// this copy exits and the elevated one takes over (with its window open).
+/// Turning it off takes effect at the next start; the running copy stays
+/// elevated until then.
+#[tauri::command]
+pub fn set_admin_mode(app: AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        let _ = (app, enabled);
+        Err("only available on Windows".into())
+    }
+
+    #[cfg(windows)]
+    {
+        use crate::elevation;
+        let before = crate::prefs::load(&app);
+        let mut prefs = before;
+
+        if !enabled {
+            // keep starting at login, just without admin
+            let had_task = elevation::task_exists();
+            elevation::delete_task()
+                .map_err(|e| format!("could not remove the admin login task: {e}"))?;
+            prefs.run_as_admin = false;
+            crate::prefs::store(&app, prefs)?;
+            if had_task {
+                if let Err(e) = app.autolaunch().enable() {
+                    log::warn!("could not restore the login item: {e}");
+                }
+            }
+            return Ok(());
+        }
+
+        prefs.run_as_admin = true;
+        if elevation::is_elevated() {
+            crate::prefs::store(&app, prefs)?;
+            crate::refresh_autostart(&app);
+            return Ok(());
+        }
+
+        // the elevated copy must open its window even if this copy was
+        // started in the background: the user is looking at the settings
+        prefs.show_on_next_start = true;
+        crate::prefs::store(&app, prefs)?;
+        match elevation::relaunch_elevated() {
+            Ok(true) => {
+                // let this call answer the window, then make way
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    app.exit(0);
+                });
+                Ok(())
+            }
+            Ok(false) => {
+                crate::prefs::store(&app, before)?;
+                Err("Windows did not give permission".into())
+            }
+            Err(e) => {
+                crate::prefs::store(&app, before)?;
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Whether a manual launch should go straight to the tray.

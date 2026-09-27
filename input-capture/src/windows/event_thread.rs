@@ -106,10 +106,6 @@ enum ClientUpdate {
     Destroy(Position),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
-}
-
 fn try_send_event(
     pos: Position,
     event: CaptureEvent,
@@ -447,8 +443,14 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin);
+    // Never block here: this runs inside the hook, and a hook that doesn't
+    // return stalls every physical mouse event on the machine. If the
+    // service can't take the event it can't release the capture either,
+    // so don't capture at all - the mouse stays with this machine.
+    if let Err(e) = try_send_event(pos, CaptureEvent::Begin) {
+        log::warn!("service not keeping up, not capturing: {e}");
+        ACTIVE_CLIENT.take();
+    }
 
     ret
 }
@@ -474,13 +476,34 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    /* notify mainthread (drop events if sending too fast) */
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
+    /* notify mainthread */
+    if !forward(pos, Event::Pointer(pointer_event)) {
+        return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
     /* don't pass event to applications */
     LRESULT(1)
+}
+
+/// Hand a captured event to the service. Returns `false` when the capture
+/// was dropped because the service stopped taking events.
+///
+/// A full queue means the service is stuck, and a stuck service will never
+/// release the capture - so the physical mouse and keyboard would stay
+/// swallowed indefinitely. Give them back to this machine instead.
+fn forward(pos: Position, event: Event) -> bool {
+    match try_send_event(pos, CaptureEvent::Input(event)) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            log::warn!("service not keeping up, releasing the mouse and keyboard");
+            ACTIVE_CLIENT.take();
+            false
+        }
+        Err(TrySendError::Closed(_)) => {
+            ACTIVE_CLIENT.take();
+            false
+        }
+    }
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -497,8 +520,8 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
-        log::warn!("e: {e}");
+    if !forward(client, Event::Keyboard(key_event)) {
+        return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
     /* don't pass event to applications */

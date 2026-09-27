@@ -281,5 +281,10 @@ export const backend = {
   /** restart into an installed update (never resolves: the app exits) */
   relaunchForUpdate: () => invoke<void>("relaunch_for_update"),
   getPlatform: () => invoke<string>("get_platform"),
+  /** "Control admin windows" (Windows only) */
+  getAdminMode: () =>
+    invoke<{ supported: boolean; enabled: boolean; elevated: boolean }>("get_admin_mode"),
+  /** turning it on may restart Vylo as administrator after a UAC prompt */
+  setAdminMode: (enabled: boolean) => invoke<void>("set_admin_mode", { enabled }),
   ipcConnected: () => invoke<boolean>("ipc_connected"),
 };

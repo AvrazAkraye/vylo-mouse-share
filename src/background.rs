@@ -14,9 +14,13 @@
 //! them — after which the machine stops capturing until the app is restarted.
 //! So opt the whole process out of throttling.
 //!
-//! macOS has no equivalent switch that applies here (App Nap does not
-//! suspend a process holding a CGEventTap, and the tap itself already
-//! recovers from `kCGEventTapDisabledByTimeout`), so this is a no-op there.
+//! macOS does the same through App Nap: once the window is hidden or
+//! minimized, the process's timers are coalesced and its threads
+//! deprioritized, so the input channel and the injected pointer lag or
+//! stall while the peer is driving this Mac. The event tap recovers from
+//! `kCGEventTapDisabledByTimeout`, but nothing recovers the latency. An
+//! `NSProcessInfo` activity held for the life of the process keeps App Nap
+//! off (idle system sleep is still allowed).
 
 /// Opt this process out of OS background throttling. Safe to call more than
 /// once; failures are logged and otherwise ignored.
@@ -50,5 +54,24 @@ pub fn opt_out_of_throttling() {
             // older builds may not know the policy - not fatal
             Err(e) => log::warn!("could not disable background throttling: {e}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+        use std::sync::Once;
+
+        static APP_NAP_OFF: Once = Once::new();
+        APP_NAP_OFF.call_once(|| {
+            let activity = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+                NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+                    | NSActivityOptions::LatencyCritical,
+                &NSString::from_str("Sharing mouse, keyboard and clipboard"),
+            );
+            // the activity lasts as long as this token lives: for the whole
+            // process, so it is never ended
+            std::mem::forget(activity);
+            log::debug!("App Nap disabled");
+        });
     }
 }

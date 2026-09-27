@@ -89,6 +89,44 @@ export function SettingsScreen() {
     }
   };
 
+  /* Control admin windows (Windows only; see elevation.rs) */
+  const [adminMode, setAdminMode] = useState<{
+    supported: boolean;
+    enabled: boolean;
+    elevated: boolean;
+  } | null>(null);
+  const [adminError, setAdminError] = useState<string | null>(null);
+  useEffect(() => {
+    backend
+      .getAdminMode()
+      .then(setAdminMode)
+      .catch(() => setAdminMode(null));
+  }, []);
+  const toggleAdminMode = async (v: boolean) => {
+    setAdminError(null);
+    try {
+      // turning it on may restart Vylo as administrator right after this
+      await backend.setAdminMode(v);
+    } catch (e) {
+      setAdminError(String(e));
+    }
+    backend
+      .getAdminMode()
+      .then(setAdminMode)
+      .catch(() => {});
+    backend
+      .getAutostart()
+      .then(setAutostart)
+      .catch(() => {});
+  };
+  const adminHint = adminError
+    ? `Not changed: ${adminError}`
+    : adminMode?.enabled && !adminMode.elevated
+      ? "On, but Vylo isn't running as administrator yet. Restart Vylo and allow the Windows prompt."
+      : !adminMode?.enabled && adminMode?.elevated
+        ? "Off from the next start. Vylo runs as administrator until you restart it."
+        : "Lets the other computer's mouse click apps that run as administrator, like installers and VPN pop-ups. Windows asks for permission once. While on, you can't drop files from Explorer onto the Vylo window.";
+
   /* File dir */
   const changeDir = async () => {
     try {
@@ -199,6 +237,15 @@ export function SettingsScreen() {
               onCheckedChange={toggleStartHidden}
             />
           </Row>
+          {adminMode?.supported && (
+            <Row label="Control admin windows" hint={adminHint}>
+              <Switch
+                checked={adminMode.enabled}
+                aria-label="Control admin windows"
+                onCheckedChange={toggleAdminMode}
+              />
+            </Row>
+          )}
         </CardBody>
       </Card>
 

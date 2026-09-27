@@ -6,6 +6,7 @@ use input_event::{
 
 use async_trait::async_trait;
 use std::ops::BitOrAssign;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::task::AbortHandle;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -103,14 +104,28 @@ impl WindowsEmulation {
     }
 }
 
+/// Whether the last injection was refused, so a refusal is logged once per
+/// streak instead of once per mouse move.
+static INPUT_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Inject one event, and give up if Windows refuses it.
+///
+/// Windows refuses injected input while a UAC prompt or the lock screen is
+/// up, and may while an app running as administrator is in front (UIPI).
+/// None of that clears by trying again. This used to retry in a loop, which
+/// froze the whole service (it runs on one thread), and with it the capture
+/// side, whose hook then stalled the physical mouse.
 fn send_input_safe(input: INPUT) {
-    unsafe {
-        loop {
-            /* retval = number of successfully submitted events */
-            if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) > 0 {
-                break;
-            }
-        }
+    /* retval = number of successfully submitted events */
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if sent > 0 {
+        INPUT_REFUSED.store(false, Ordering::Relaxed);
+    } else if !INPUT_REFUSED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "windows refused injected input ({}); a UAC prompt, the lock screen or an \
+             app running as administrator is probably in front",
+            std::io::Error::last_os_error()
+        );
     }
 }
 

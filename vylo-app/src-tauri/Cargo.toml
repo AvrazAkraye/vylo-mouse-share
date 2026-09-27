@@ -1,6 +1,6 @@
 [package]
 name = "vylo-app"
-version = "1.0.6"
+version = "1.0.7"
 description = "Vylo Mouse Share desktop app"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -27,3 +27,14 @@ env_logger = "0.11"
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# "Control admin windows": elevation check, UAC relaunch (see src/elevation.rs)
+windows = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
