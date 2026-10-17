@@ -215,6 +215,11 @@ impl CaptureTask {
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
+        // never keep forwarding to a client that no longer exists
+        if self.active_client == Some(handle) {
+            self.active_client = None;
+            self.drag_pending = false;
+        }
         self.tuning.remove(&handle);
         self.tuning_state.remove(&handle);
     }
@@ -239,20 +244,13 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
+    /// position and type of a capture; `None` once it has been destroyed
+    /// (an event for it may still be in flight)
+    fn lookup(&self, handle: CaptureHandle) -> Option<(Position, CaptureType)> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
-    }
-
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+            .map(|&(_, p, t)| (p, t))
     }
 
     async fn run(mut self) {
@@ -359,6 +357,12 @@ impl CaptureTask {
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
+                        // the client being removed holds the mouse right now:
+                        // hand it back properly (key-ups, Leave) first
+                        if self.active_client == Some(h) {
+                            log::info!("releasing capture: client {h} removed");
+                            self.release_capture(capture).await?;
+                        }
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
@@ -387,6 +391,17 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
+        // The capture was destroyed while this event was in flight (v1.0.7
+        // aborted here with "no such capture"). Drop the event; if it grabbed
+        // the mouse for nobody, give the mouse back.
+        let Some((pos, capture_type)) = self.lookup(handle) else {
+            log::debug!("dropping event for removed capture {handle}: {event:?}");
+            if event == CaptureEvent::Begin && self.active_client.is_none() {
+                capture.release().await?;
+            }
+            return Ok(());
+        };
+
         if event == CaptureEvent::Begin {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
@@ -394,10 +409,10 @@ impl CaptureTask {
         }
 
         // enter only capture (for incoming connections)
-        if self.get_type(handle) == CaptureType::EnterOnly {
+        if capture_type == CaptureType::EnterOnly {
             // if there is no active outgoing connection at the current capture,
             // we release the capture
-            if !self.is_default_capture_at(self.get_pos(handle)) {
+            if !self.is_default_capture_at(pos) {
                 log::info!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
@@ -444,7 +459,7 @@ impl CaptureTask {
             return Ok(());
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = to_proto_pos(pos.opposite());
 
         let event = match event {
             CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),

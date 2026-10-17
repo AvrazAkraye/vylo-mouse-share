@@ -6102,7 +6102,7 @@ dependencies = [
 
 [[package]]
 name = "vylo-app"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "env_logger",
  "lan-mouse-ipc",
@@ -6124,7 +6124,7 @@ dependencies = [
 
 [[package]]
 name = "vylo-mouse-share"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "arboard",
  "bincode",

@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
-    mem::swap,
     task::{Poll, ready},
 };
 
@@ -151,7 +150,12 @@ pub struct InputCapture {
 impl InputCapture {
     /// create a new client with the given id
     pub async fn create(&mut self, id: CaptureHandle, pos: Position) -> Result<(), CaptureError> {
-        assert!(!self.id_map.contains_key(&id));
+        if let Some(&old) = self.id_map.get(&id) {
+            // a duplicate create used to be an assert, which (panic = abort)
+            // took the whole app down; the existing capture stays as it is
+            log::warn!("capture {id} already exists @ {old}, ignoring create @ {pos}");
+            return Ok(());
+        }
 
         self.id_map.insert(id, pos);
 
@@ -166,10 +170,16 @@ impl InputCapture {
 
     /// destroy the client with the given id, if it exists
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let pos = self
-            .id_map
-            .remove(&id)
-            .expect("no position for this handle");
+        let Some(pos) = self.id_map.remove(&id) else {
+            log::warn!("no capture {id} to destroy");
+            return Ok(());
+        };
+
+        // Events already fanned out to every id at this position wait in
+        // `pending`; one addressed to the destroyed id would reach a caller
+        // that no longer knows it (v1.0.7 crashed on exactly that when an
+        // incoming connection was re-registered at the active client's edge).
+        self.pending.retain(|&(i, _)| i != id);
 
         log::debug!("destroying capture {id} @ {pos}");
         let remaining = self.position_map.get_mut(&pos).expect("id vector");
@@ -247,50 +257,45 @@ impl Stream for InputCapture {
             return Poll::Ready(Some(Ok(e)));
         }
 
-        // ready
-        let event = ready!(self.capture.poll_next_unpin(cx));
+        loop {
+            // ready
+            let event = ready!(self.capture.poll_next_unpin(cx));
 
-        // stream closed
-        let event = match event {
-            Some(e) => e,
-            None => return Poll::Ready(None),
-        };
+            // stream closed
+            let event = match event {
+                Some(e) => e,
+                None => return Poll::Ready(None),
+            };
 
-        // error occurred
-        let (pos, event) = match event {
-            Ok(e) => e,
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        };
+            // error occurred
+            let (pos, event) = match event {
+                Ok(e) => e,
+                Err(e) => return Poll::Ready(Some(Err(e))),
+            };
 
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
-        }
-
-        let len = self
-            .position_map
-            .get(&pos)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
-
-        match len {
-            0 => Poll::Pending,
-            1 => Poll::Ready(Some(Ok((
-                self.position_map.get(&pos).expect("no id")[0],
-                event,
-            )))),
-            _ => {
-                let mut position_map = HashMap::new();
-                swap(&mut self.position_map, &mut position_map);
-                {
-                    for &id in position_map.get(&pos).expect("position") {
-                        self.pending.push_back((id, event));
-                    }
-                }
-                swap(&mut self.position_map, &mut position_map);
-
-                Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))))
+            // handle key presses
+            if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
+                event
+            {
+                self.update_pressed_keys(key, state);
             }
+
+            let ids = match self.position_map.get(&pos) {
+                Some(ids) if !ids.is_empty() => ids,
+                // no capture left at this position (destroyed while the
+                // event was queued): drop it and poll the next one. Returning
+                // Pending here registered no waker and could stall the stream.
+                _ => continue,
+            };
+
+            let first = ids[0];
+            if ids.len() > 1 {
+                let rest: Vec<CaptureHandle> = ids[1..].to_vec();
+                for id in rest {
+                    self.pending.push_back((id, event));
+                }
+            }
+            return Poll::Ready(Some(Ok((first, event))));
         }
     }
 }
@@ -367,4 +372,85 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::Context;
+
+    /// a backend that replays a fixed list of events
+    struct Replay(VecDeque<(Position, CaptureEvent)>);
+
+    impl Stream for Replay {
+        type Item = Result<(Position, CaptureEvent), CaptureError>;
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.0.pop_front().map(Ok))
+        }
+    }
+
+    #[async_trait]
+    impl Capture for Replay {
+        async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn destroy(&mut self, _pos: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn release(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn terminate(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    fn capture(events: Vec<(Position, CaptureEvent)>) -> InputCapture {
+        InputCapture {
+            capture: Box::new(Replay(events.into())),
+            pressed_keys: HashSet::new(),
+            position_map: Default::default(),
+            id_map: Default::default(),
+            pending: Default::default(),
+        }
+    }
+
+    // the v1.0.7 crash: an event fanned out to two ids at one edge, one id
+    // destroyed before its copy was taken
+    #[tokio::test]
+    async fn destroyed_id_gets_no_queued_event() {
+        let mut c = capture(vec![
+            (Position::Left, CaptureEvent::Begin),
+            (Position::Left, CaptureEvent::Begin),
+        ]);
+        c.create(1, Position::Left).await.unwrap();
+        c.create(2, Position::Left).await.unwrap();
+        assert_eq!(c.next().await.unwrap().unwrap().0, 1);
+        c.destroy(2).await.unwrap();
+        assert_eq!(c.next().await.unwrap().unwrap().0, 1);
+        assert!(c.next().await.is_none());
+    }
+
+    // an event for an edge with no capture left is skipped, not a stall
+    #[tokio::test]
+    async fn event_for_removed_position_is_skipped() {
+        let mut c = capture(vec![
+            (Position::Left, CaptureEvent::Begin),
+            (Position::Right, CaptureEvent::Begin),
+        ]);
+        c.create(1, Position::Right).await.unwrap();
+        assert_eq!(c.next().await.unwrap().unwrap().0, 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_and_unknown_destroy_do_not_panic() {
+        let mut c = capture(vec![]);
+        c.create(1, Position::Left).await.unwrap();
+        c.create(1, Position::Right).await.unwrap();
+        c.destroy(7).await.unwrap();
+        c.destroy(1).await.unwrap();
+        c.destroy(1).await.unwrap();
+        assert!(c.id_map.is_empty() && c.position_map.is_empty());
+    }
 }
